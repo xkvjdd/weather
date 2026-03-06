@@ -1,141 +1,123 @@
-import io
+"""
+fetch_observations.py
+─────────────────────
+Fetches the last 3 days of hourly temperature observations for each airport
+using the Open-Meteo Historical Forecast API (free, no API key required).
+
+Data is already in local time (Open-Meteo returns local timestamps when
+timezone is specified).
+
+Output: data/dashboard/observations.parquet
+Columns: airport | timestamp_utc | timestamp_local | temp
+"""
+
 import os
-import pandas as pd
+import time
 import requests
+import pandas as pd
 
+# ── Airport config ────────────────────────────────────────────────────────────
+# lat/lon sourced from standard airport coordinates
 STATIONS = {
-    "ATL": {"icao": "KATL", "meteostat_id": "72219"},
-    "NYC": {"icao": "KLGA", "meteostat_id": "72503"},
-    "CHI": {"icao": "KORD", "meteostat_id": "72530"},
-    "DAL": {"icao": "KDAL", "meteostat_id": "72258"},
-    "SEA": {"icao": "KSEA", "meteostat_id": "72793"},
-    "MIA": {"icao": "KMIA", "meteostat_id": "72202"},
-    "TOR": {"icao": "CYYZ", "meteostat_id": "71624"},
-    "PAR": {"icao": "LFPG", "meteostat_id": "07157"},
-    "SEL": {"icao": "RKSI", "meteostat_id": "47113"},
-    "ANK": {"icao": "LTAC", "meteostat_id": "17128"},
-    "BUE": {"icao": "SAEZ", "meteostat_id": "87576"},
-    "LON": {"icao": "EGLL", "meteostat_id": "03772"},
-    "WLG": {"icao": "NZWN", "meteostat_id": "93436"},
+    "ATL": {"lat": 33.6407,  "lon": -84.4277,  "tz": "America/New_York"},
+    "NYC": {"lat": 40.7772,  "lon": -73.8726,  "tz": "America/New_York"},
+    "CHI": {"lat": 41.9742,  "lon": -87.9073,  "tz": "America/Chicago"},
+    "DAL": {"lat": 32.8481,  "lon": -96.8512,  "tz": "America/Chicago"},
+    "SEA": {"lat": 47.4502,  "lon": -122.3088, "tz": "America/Los_Angeles"},
+    "MIA": {"lat": 25.7959,  "lon": -80.2870,  "tz": "America/New_York"},
+    "TOR": {"lat": 43.6777,  "lon": -79.6248,  "tz": "America/Toronto"},
+    "PAR": {"lat": 49.0097,  "lon":   2.5479,  "tz": "Europe/Paris"},
+    "SEL": {"lat": 37.4691,  "lon": 126.4510,  "tz": "Asia/Seoul"},
+    "ANK": {"lat": 40.1281,  "lon":  32.9951,  "tz": "Europe/Istanbul"},
+    "BUE": {"lat": -34.8222, "lon": -58.5358,  "tz": "America/Argentina/Buenos_Aires"},
+    "LON": {"lat": 51.4775,  "lon":  -0.4614,  "tz": "Europe/London"},
+    "WLG": {"lat": -41.3272, "lon": 174.8052,  "tz": "Pacific/Auckland"},
 }
 
-CITY_TO_TZ = {
-    "ATL": "America/New_York",
-    "NYC": "America/New_York",
-    "CHI": "America/Chicago",
-    "DAL": "America/Chicago",
-    "SEA": "America/Los_Angeles",
-    "MIA": "America/New_York",
-    "TOR": "America/Toronto",
-    "PAR": "Europe/Paris",
-    "SEL": "Asia/Seoul",
-    "ANK": "Europe/Istanbul",
-    "BUE": "America/Argentina/Buenos_Aires",
-    "LON": "Europe/London",
-    "WLG": "Pacific/Auckland",
-}
-
-BASE_URL = "https://data.meteostat.net/hourly/{year}/{station}.csv.gz"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Python requests"
-TIMEOUT = 60
-
+# ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-DATA_DIR = os.path.join(REPO_ROOT, "data", "dashboard")
+REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
+DATA_DIR   = os.path.join(REPO_ROOT, "data", "dashboard")
 os.makedirs(DATA_DIR, exist_ok=True)
-
 OUTPUT_PATH = os.path.join(DATA_DIR, "observations.parquet")
 
-NOW = pd.Timestamp.now("UTC")
-YEAR = NOW.year
+# ── Date range: today and previous 2 days (3 days total) ─────────────────────
+NOW       = pd.Timestamp.now("UTC")
+END_DATE  = NOW.strftime("%Y-%m-%d")
+START_DATE = (NOW - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+
+BASE_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+TIMEOUT = 30
+RETRY_WAIT = 5   # seconds between retries on rate-limit
 
 
-def download_station_year(station: str, year: int) -> pd.DataFrame:
-    url = BASE_URL.format(year=year, station=station)
-    resp = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+def fetch_airport(airport: str, meta: dict) -> pd.DataFrame:
+    params = {
+        "latitude":        meta["lat"],
+        "longitude":       meta["lon"],
+        "start_date":      START_DATE,
+        "end_date":        END_DATE,
+        "hourly":          "temperature_2m",
+        "timezone":        meta["tz"],
+        "temperature_unit": "celsius",
+    }
 
-    if resp.status_code == 404:
+    for attempt in range(3):
+        resp = requests.get(BASE_URL, params=params, timeout=TIMEOUT)
+        if resp.status_code == 429:
+            print(f"  rate-limited, waiting {RETRY_WAIT}s …")
+            time.sleep(RETRY_WAIT)
+            continue
+        resp.raise_for_status()
+        break
+
+    data = resp.json()
+
+    hourly  = data.get("hourly", {})
+    times   = hourly.get("time", [])
+    temps   = hourly.get("temperature_2m", [])
+
+    if not times:
+        print(f"  no hourly data returned")
         return pd.DataFrame()
 
-    resp.raise_for_status()
-    return pd.read_csv(io.BytesIO(resp.content), compression="gzip")
+    df = pd.DataFrame({"timestamp_local_str": times, "temp": temps})
+    df = df[df["temp"].notna()].copy()
+
+    # Parse local timestamp (Open-Meteo returns ISO strings in the requested tz)
+    df["timestamp_local"] = pd.to_datetime(df["timestamp_local_str"])
+
+    # Derive UTC
+    local_tz = meta["tz"]
+    df["timestamp_utc"] = (
+        df["timestamp_local"]
+        .dt.tz_localize(local_tz, ambiguous="NaT", nonexistent="NaT")
+        .dt.tz_convert("UTC")
+        .dt.tz_localize(None)
+    )
+    df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(None)
+    df["airport"] = airport
+
+    return df[["airport", "timestamp_utc", "timestamp_local", "temp"]].sort_values("timestamp_local").reset_index(drop=True)
 
 
-def parse_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    out = df.copy()
-    lower_cols = {str(c).lower(): c for c in out.columns}
-
-    if "time" in lower_cols:
-        out["timestamp_utc"] = pd.to_datetime(out[lower_cols["time"]], errors="coerce", utc=True)
-
-    elif "date" in lower_cols and "hour" in lower_cols:
-        date_col = lower_cols["date"]
-        hour_col = lower_cols["hour"]
-        out["timestamp_utc"] = pd.to_datetime(
-            out[date_col].astype(str) + " " + out[hour_col].astype(str).str.zfill(2) + ":00:00",
-            errors="coerce",
-            utc=True,
-        )
-
-    else:
-        first_col = out.columns[0]
-        out["timestamp_utc"] = pd.to_datetime(out[first_col], errors="coerce", utc=True)
-
-    out = out[out["timestamp_utc"].notna()].copy()
-    return out
-
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 frames = []
 
 for airport, meta in STATIONS.items():
-    station = meta["meteostat_id"]
-    print(f"Downloading {airport}")
-
+    print(f"Fetching {airport} ({meta['tz']})  {START_DATE} → {END_DATE}")
     try:
-        df = download_station_year(station, YEAR)
+        df = fetch_airport(airport, meta)
         if df.empty:
-            print(f"  no file for {YEAR}")
-            continue
-
-        df = parse_timestamp_column(df)
-        if df.empty:
-            print("  empty after timestamp parse")
-            continue
-
-        if "temp" not in df.columns:
-            print(f"  missing temp column; cols={list(df.columns)}")
-            continue
-
-        max_ts = df["timestamp_utc"].max()
-        min_ts = df["timestamp_utc"].min()
-        cut = max_ts - pd.Timedelta(hours=96)
-
-        print(f"  source range: {min_ts} -> {max_ts}")
-        print(f"  using cut:    {cut}")
-
-        df = df[df["timestamp_utc"] >= cut].copy()
-        if df.empty:
-            print("  no rows after source-relative 96h cut")
-            continue
-
-        tz_name = CITY_TO_TZ[airport]
-
-        out = pd.DataFrame({
-            "airport": airport,
-            "timestamp_utc": df["timestamp_utc"].dt.tz_localize(None),
-            "timestamp_local": df["timestamp_utc"].dt.tz_convert(tz_name).dt.tz_localize(None),
-            "temp": pd.to_numeric(df["temp"], errors="coerce"),
-        })
-
-        out = out[out["temp"].notna()].sort_values("timestamp_local").reset_index(drop=True)
-        frames.append(out)
-        print(f"  kept {len(out):,} rows")
-
+            print(f"  ✗ no data")
+        else:
+            print(f"  ✓ {len(df):,} rows  (latest: {df['timestamp_local'].max()})")
+            frames.append(df)
     except Exception as e:
-        print(f"  FAILED: {e}")
+        print(f"  ✗ FAILED: {e}")
+
+    time.sleep(0.5)   # polite pacing between airports
 
 if frames:
     final = pd.concat(frames, ignore_index=True)
@@ -144,5 +126,6 @@ else:
     final = pd.DataFrame(columns=["airport", "timestamp_utc", "timestamp_local", "temp"])
 
 final.to_parquet(OUTPUT_PATH, index=False)
-
-print(f"\nSaved {len(final):,} rows -> {OUTPUT_PATH}")
+print(f"\n✓ Saved {len(final):,} rows → {OUTPUT_PATH}")
+print(f"  Airports: {sorted(final['airport'].unique().tolist())}")
+print(f"  Time range: {final['timestamp_local'].min()} → {final['timestamp_local'].max()}")
