@@ -47,7 +47,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(DATA_DIR, "observations.parquet")
 
 NOW = pd.Timestamp.now("UTC")
-CUT = NOW - pd.Timedelta(hours=96)
 YEAR = NOW.year
 
 
@@ -106,13 +105,20 @@ for airport, meta in STATIONS.items():
             print("  empty after timestamp parse")
             continue
 
-        df = df[df["timestamp_utc"] >= CUT].copy()
-        if df.empty:
-            print("  no rows in last 96h")
-            continue
-
         if "temp" not in df.columns:
             print(f"  missing temp column; cols={list(df.columns)}")
+            continue
+
+        max_ts = df["timestamp_utc"].max()
+        min_ts = df["timestamp_utc"].min()
+        cut = max_ts - pd.Timedelta(hours=96)
+
+        print(f"  source range: {min_ts} -> {max_ts}")
+        print(f"  using cut:    {cut}")
+
+        df = df[df["timestamp_utc"] >= cut].copy()
+        if df.empty:
+            print("  no rows after source-relative 96h cut")
             continue
 
         tz_name = CITY_TO_TZ[airport]
