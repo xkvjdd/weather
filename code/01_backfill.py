@@ -2,9 +2,7 @@ import io
 import os
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
 
-# same stations as your 01_data.py
 STATIONS = {
     "ATL": {"icao": "KATL", "meteostat_id": "72219"},
     "NYC": {"icao": "KLGA", "meteostat_id": "72503"},
@@ -22,74 +20,93 @@ STATIONS = {
 }
 
 BASE_URL = "https://data.meteostat.net/hourly/{year}/{station}.csv.gz"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Python requests"
+TIMEOUT = 60
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(SCRIPT_DIR, "..", "data", "dashboard")
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+DATA_DIR = os.path.join(REPO_ROOT, "data", "dashboard")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 OUTPUT_PATH = os.path.join(DATA_DIR, "observations.parquet")
 
-NOW = pd.Timestamp.utcnow()
+NOW = pd.Timestamp.now("UTC")
 CUT = NOW - pd.Timedelta(hours=96)
+YEAR = NOW.year
 
 
-def download_station_year(station, year):
-
+def download_station_year(station: str, year: int) -> pd.DataFrame:
     url = BASE_URL.format(year=year, station=station)
+    resp = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
 
-    r = requests.get(url, timeout=60)
-
-    if r.status_code == 404:
+    if resp.status_code == 404:
         return pd.DataFrame()
 
-    r.raise_for_status()
+    resp.raise_for_status()
+    return pd.read_csv(io.BytesIO(resp.content), compression="gzip")
 
-    return pd.read_csv(io.BytesIO(r.content), compression="gzip")
+
+def parse_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    if "time" in df.columns:
+        ts = pd.to_datetime(df["time"], errors="coerce", utc=True)
+    else:
+        first_col = df.columns[0]
+        ts = pd.to_datetime(df[first_col], errors="coerce", utc=True)
+
+    out = df.copy()
+    out["timestamp_utc"] = ts
+    out = out[out["timestamp_utc"].notna()].copy()
+    return out
 
 
 frames = []
 
-year = datetime.utcnow().year
-
 for airport, meta in STATIONS.items():
-
     station = meta["meteostat_id"]
-
     print(f"Downloading {airport}")
 
-    df = download_station_year(station, year)
+    try:
+        df = download_station_year(station, YEAR)
+        if df.empty:
+            print(f"  no file for {YEAR}")
+            continue
 
-    if df.empty:
-        continue
+        df = parse_timestamp_column(df)
+        if df.empty:
+            print("  empty after timestamp parse")
+            continue
 
-    df["timestamp"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df[df["timestamp_utc"] >= CUT].copy()
+        if df.empty:
+            print("  no rows in last 96h")
+            continue
 
-    df = df[df["timestamp"] >= CUT]
+        if "temp" not in df.columns:
+            print("  missing temp column")
+            continue
 
-    if df.empty:
-        continue
-
-    out = pd.DataFrame(
-        {
+        out = pd.DataFrame({
             "airport": airport,
-            "timestamp_local": df["timestamp"],
-            "temp": df["temp"],
-        }
-    )
+            "timestamp_local": df["timestamp_utc"].dt.tz_convert(None),
+            "temp": pd.to_numeric(df["temp"], errors="coerce"),
+        })
 
-    frames.append(out)
+        out = out[out["temp"].notna()].sort_values("timestamp_local").reset_index(drop=True)
+        frames.append(out)
+        print(f"  kept {len(out):,} rows")
 
+    except Exception as e:
+        print(f"  FAILED: {e}")
 
 if frames:
-
     final = pd.concat(frames, ignore_index=True)
-
+    final = final.sort_values(["airport", "timestamp_local"]).reset_index(drop=True)
 else:
-
     final = pd.DataFrame(columns=["airport", "timestamp_local", "temp"])
-
 
 final.to_parquet(OUTPUT_PATH, index=False)
 
-print(f"\nSaved {len(final):,} rows")
-print(OUTPUT_PATH)
+print(f"\nSaved {len(final):,} rows -> {OUTPUT_PATH}")
