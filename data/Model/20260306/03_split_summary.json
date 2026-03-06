@@ -1,0 +1,110 @@
+[
+  {
+    "horizon_bucket": "h9",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 05:00:00",
+    "max_timestamp": "2026-03-16 06:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 06:00:00",
+    "n_bucket_rows": 97525,
+    "n_train_rows": 92793,
+    "n_test_rows": 4732
+  },
+  {
+    "horizon_bucket": "h8",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 06:00:00",
+    "max_timestamp": "2026-03-16 07:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 07:00:00",
+    "n_bucket_rows": 97529,
+    "n_train_rows": 92797,
+    "n_test_rows": 4732
+  },
+  {
+    "horizon_bucket": "h7",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 07:00:00",
+    "max_timestamp": "2026-03-16 08:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 08:00:00",
+    "n_bucket_rows": 97651,
+    "n_train_rows": 92919,
+    "n_test_rows": 4732
+  },
+  {
+    "horizon_bucket": "h6",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 08:00:00",
+    "max_timestamp": "2026-03-16 09:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 09:00:00",
+    "n_bucket_rows": 97604,
+    "n_train_rows": 92873,
+    "n_test_rows": 4731
+  },
+  {
+    "horizon_bucket": "h5",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 09:00:00",
+    "max_timestamp": "2026-03-16 10:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 10:00:00",
+    "n_bucket_rows": 97609,
+    "n_train_rows": 92878,
+    "n_test_rows": 4731
+  },
+  {
+    "horizon_bucket": "h4",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 10:00:00",
+    "max_timestamp": "2026-03-16 11:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 11:00:00",
+    "n_bucket_rows": 97663,
+    "n_train_rows": 92925,
+    "n_test_rows": 4738
+  },
+  {
+    "horizon_bucket": "h3",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 11:00:00",
+    "max_timestamp": "2026-03-16 12:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 12:00:00",
+    "n_bucket_rows": 97584,
+    "n_train_rows": 92853,
+    "n_test_rows": 4731
+  },
+  {
+    "horizon_bucket": "h2",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 12:00:00",
+    "max_timestamp": "2026-03-16 13:00:00",
+    "train_end": "2025-03-15 23:59:59",
+    "test_start": "2025-03-16 00:00:00",
+    "test_end": "2026-03-16 13:00:00",
+    "n_bucket_rows": 97566,
+    "n_train_rows": 92836,
+    "n_test_rows": 4730
+  },
+  {
+    "horizon_bucket": "h1",
+    "test_months": 12,
+    "min_timestamp": "2005-01-01 13:00:00",
+    "max_timestamp": "2026-03-15 15:00:00",
+    "train_end": "2025-03-14 23:59:59",
+    "test_start": "2025-03-15 00:00:00",
+    "test_end": "2026-03-15 15:00:00",
+    "n_bucket_rows": 97654,
+    "n_train_rows": 92912,
+    "n_test_rows": 4742
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "rows_raw": 2342428,
+  "rows_processed": 2342017,
+  "solar_columns_added": [
+    "solar_noon_hour_local",
+    "solar_noon_ts",
+    "solar_hour_angle_deg",
+    "solar_elevation_deg",
+    "solar_zenith_deg",
+    "is_daylight"
+  ]
+}
