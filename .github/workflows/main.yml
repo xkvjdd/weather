@@ -24,7 +24,7 @@ jobs:
 
       - name: Run backfill script
         run: |
-          python code/01_backfill_observations_parquet.py
+          python code/01_backfill.py
 
       - name: Commit parquet
         run: |
