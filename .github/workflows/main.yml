@@ -4,7 +4,12 @@ on:
   workflow_dispatch:   # allows manual run
   schedule:
     - cron: "0 */6 * * *"   # every 6 hours
+  schedule:
+    - cron: "15 * * * *"
 
+permissions:
+  contents: write
+  
 jobs:
   backfill:
     runs-on: ubuntu-latest
