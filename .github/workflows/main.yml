@@ -1,0 +1,35 @@
+name: Backfill Observations
+
+on:
+  workflow_dispatch:   # allows manual run
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: |
+          pip install pandas pyarrow requests
+
+      - name: Run backfill script
+        run: |
+          python code/01_backfill_observations_parquet.py
+
+      - name: Commit parquet
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add data/dashboard/observations.parquet
+          git commit -m "update observations" || echo "no changes"
+          git push
