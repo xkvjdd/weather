@@ -9,7 +9,6 @@ permissions:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,7 +22,12 @@ jobs:
 
       - name: Install packages
         run: |
-          pip install pandas pyarrow requests selenium lxml html5lib
+          pip install pandas pyarrow playwright
+
+      - name: Install Chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Run backfill script
         run: |
