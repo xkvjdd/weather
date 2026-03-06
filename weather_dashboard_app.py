@@ -146,7 +146,11 @@ def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forec
             "#2563eb", "#1d4ed8", "#1e40af", "#1e3a8a"
         ]
         n = len(model_hist)
-        colors = blue_scale[-n:] if n <= len(blue_scale) else [blue_scale[min(int(i * len(blue_scale) / n), len(blue_scale)-1)] for i in range(n)]
+        colors = (
+            blue_scale[-n:]
+            if n <= len(blue_scale)
+            else [blue_scale[min(int(i * len(blue_scale) / n), len(blue_scale) - 1)] for i in range(n)]
+        )
         for i, (_, row) in enumerate(model_hist.iterrows()):
             y = safe_float(row.get("projected_max_temp"))
             if y is None:
@@ -269,26 +273,19 @@ for airport in airports:
         st.subheader(airport)
         st.markdown(f"**Current temp**  \n{fmt_num(s['current_temp'])}")
         st.markdown(
-            f"**Modelled max**  
-{fmt_num(s['model_now'])}  
-"
+            f"**Modelled max**  \n{fmt_num(s['model_now'])}  \n"
             f"<span style='color:gray;font-size:12px'>{fmt_delta(s['model_delta'])} vs last model</span>",
             unsafe_allow_html=True,
         )
         st.markdown(
-            f"**Forecast max**  
-Avg: {fmt_num(s['fc_avg'])}  
-"
-            f"S1: {fmt_num(s['fc1'])}  
-S2: {fmt_num(s['fc2'])}  
-S3: {fmt_num(s['fc3'])}  
-"
+            f"**Forecast max**  \nAvg: {fmt_num(s['fc_avg'])}  \n"
+            f"S1: {fmt_num(s['fc1'])}  \nS2: {fmt_num(s['fc2'])}  \nS3: {fmt_num(s['fc3'])}  \n"
             f"<span style='color:gray;font-size:12px'>{fmt_delta(s['fc_delta'])} vs last forecast</span>",
             unsafe_allow_html=True,
         )
         st.markdown("**Last updated**")
-        st.caption(f"Obs: {fmt_ts(s['obs_updated'])}
-
-Model: {fmt_ts(s['model_updated'])}
-
-Forecast: {fmt_ts(s['fc_updated'])}")
+        st.caption(
+            f"Obs: {fmt_ts(s['obs_updated'])}\n\n"
+            f"Model: {fmt_ts(s['model_updated'])}\n\n"
+            f"Forecast: {fmt_ts(s['fc_updated'])}"
+        )
