@@ -1,205 +1,193 @@
+"""
+fetch_observations.py
+─────────────────────
+Scrapes hourly temperature observations from Weather Underground history pages
+using Playwright (headless browser) for each airport over the last 3 days.
+
+Install dependencies:
+    pip install playwright pandas pyarrow
+    playwright install chromium
+
+Output: data/dashboard/observations.parquet
+Columns: airport | timestamp_utc | timestamp_local | temp
+"""
+
 import os
+import re
 import time
-from datetime import datetime, timedelta
-
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+from datetime import timedelta
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+# ── Airport config ─────────────────────────────────────────────────────────────
+# URL pattern: https://www.wunderground.com/history/daily/{country}/{city}/{icao}/date/{YYYY-M-D}
 STATIONS = {
-    "ATL": {"icao": "KATL", "history_path": "us/ga/atlanta/KATL"},
-    "NYC": {"icao": "KLGA", "history_path": "us/ny/new-york/KLGA"},
-    "CHI": {"icao": "KORD", "history_path": "us/il/chicago/KORD"},
-    "DAL": {"icao": "KDAL", "history_path": "us/tx/dallas/KDAL"},
-    "SEA": {"icao": "KSEA", "history_path": "us/wa/seattle/KSEA"},
-    "MIA": {"icao": "KMIA", "history_path": "us/fl/miami/KMIA"},
-    "TOR": {"icao": "CYYZ", "history_path": "ca/on/toronto/CYYZ"},
-    "PAR": {"icao": "LFPG", "history_path": "fr/paris/LFPG"},
-    "SEL": {"icao": "RKSI", "history_path": "kr/incheon/RKSI"},
-    "ANK": {"icao": "LTAC", "history_path": "tr/ankara/LTAC"},
-    "BUE": {"icao": "SAEZ", "history_path": "ar/buenos-aires/SAEZ"},
-    "LON": {"icao": "EGLL", "history_path": "gb/england/london/EGLL"},
-    "WLG": {"icao": "NZWN", "history_path": "nz/wellington/NZWN"},
+    "ATL": {"url_path": "us/atlanta/KATL",         "tz": "America/New_York"},
+    "NYC": {"url_path": "us/new-york-city/KLGA",   "tz": "America/New_York"},
+    "CHI": {"url_path": "us/chicago/KORD",         "tz": "America/Chicago"},
+    "DAL": {"url_path": "us/dallas/KDAL",          "tz": "America/Chicago"},
+    "SEA": {"url_path": "us/seattle/KSEA",         "tz": "America/Los_Angeles"},
+    "MIA": {"url_path": "us/miami/KMIA",           "tz": "America/New_York"},
+    "TOR": {"url_path": "ca/toronto/CYYZ",         "tz": "America/Toronto"},
+    "PAR": {"url_path": "fr/paris/LFPG",           "tz": "Europe/Paris"},
+    "SEL": {"url_path": "kr/seoul/RKSI",           "tz": "Asia/Seoul"},
+    "ANK": {"url_path": "tr/ankara/LTAC",          "tz": "Europe/Istanbul"},
+    "BUE": {"url_path": "ar/buenos-aires/SAEZ",    "tz": "America/Argentina/Buenos_Aires"},
+    "LON": {"url_path": "gb/london/EGLL",          "tz": "Europe/London"},
+    "WLG": {"url_path": "nz/wellington/NZWN",      "tz": "Pacific/Auckland"},
 }
 
-CITY_TO_TZ = {
-    "ATL": "America/New_York",
-    "NYC": "America/New_York",
-    "CHI": "America/Chicago",
-    "DAL": "America/Chicago",
-    "SEA": "America/Los_Angeles",
-    "MIA": "America/New_York",
-    "TOR": "America/Toronto",
-    "PAR": "Europe/Paris",
-    "SEL": "Asia/Seoul",
-    "ANK": "Europe/Istanbul",
-    "BUE": "America/Argentina/Buenos_Aires",
-    "LON": "Europe/London",
-    "WLG": "Pacific/Auckland",
-}
+BASE_URL = "https://www.wunderground.com/history/daily/{path}/date/{date}"
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-DATA_DIR = os.path.join(REPO_ROOT, "data", "dashboard")
+# ── Paths ─────────────────────────────────────────────────────────────────────
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT   = os.path.dirname(SCRIPT_DIR)
+DATA_DIR    = os.path.join(REPO_ROOT, "data", "dashboard")
 os.makedirs(DATA_DIR, exist_ok=True)
-
 OUTPUT_PATH = os.path.join(DATA_DIR, "observations.parquet")
 
-
-def make_driver() -> webdriver.Chrome:
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1600,2200")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-    )
-    return webdriver.Chrome(options=options)
+# ── Date range: today + previous 2 days ───────────────────────────────────────
+NOW   = pd.Timestamp.now("UTC")
+DATES = [(NOW - timedelta(days=i)).strftime("%Y-%-m-%-d") for i in range(2, -1, -1)]
+# e.g. ["2026-3-5", "2026-3-6", "2026-3-7"]
 
 
-def build_history_url(history_path: str, dt_local: pd.Timestamp) -> str:
-    date_str = f"{dt_local.year}-{dt_local.month}-{dt_local.day}"
-    return f"https://www.wunderground.com/history/daily/{history_path}/date/{date_str}"
-
-
-def wait_for_table(driver: webdriver.Chrome, timeout: int = 25) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
-        html = driver.page_source
-        if "Daily Observations" in html and "<table" in html:
-            return True
-        time.sleep(1)
-    return False
-
-
-def parse_temp_c(value) -> float | None:
-    if pd.isna(value):
+def parse_temp(raw: str) -> float | None:
+    """Extract numeric °C value from strings like '17 °C' or '62 °F'."""
+    raw = raw.strip()
+    m = re.search(r"([-\d.]+)\s*[°]?\s*([CF])?", raw)
+    if not m:
         return None
-    s = str(value).replace("°C", "").replace("°", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return None
+    val = float(m.group(1))
+    unit = (m.group(2) or "C").upper()
+    if unit == "F":
+        val = (val - 32) * 5 / 9
+    return round(val, 1)
 
 
-def parse_time_to_timestamp_local(date_local: pd.Timestamp, time_str: str) -> pd.Timestamp | None:
+def parse_time_to_dt(time_str: str, date_str: str, tz: str) -> pd.Timestamp | None:
+    """Parse '12:00 AM' + '2026-3-7' into a tz-aware timestamp."""
     try:
-        dt = pd.to_datetime(f"{date_local.strftime('%Y-%m-%d')} {time_str}", format="%Y-%m-%d %I:%M %p")
-        return dt
-    except Exception:
-        try:
-            return pd.to_datetime(f"{date_local.strftime('%Y-%m-%d')} {time_str}")
-        except Exception:
+        # Normalise date to zero-padded format for strptime
+        parts = date_str.split("-")
+        norm_date = f"{parts[0]}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        dt = pd.to_datetime(f"{norm_date} {time_str}", format="%Y-%m-%d %I:%M %p", errors="coerce")
+        if pd.isna(dt):
+            dt = pd.to_datetime(f"{norm_date} {time_str}", errors="coerce")
+        if pd.isna(dt):
             return None
+        return dt.tz_localize(tz, ambiguous="NaT", nonexistent="NaT")
+    except Exception:
+        return None
 
 
-def scrape_daily_observations(driver: webdriver.Chrome, airport: str, dt_local: pd.Timestamp) -> pd.DataFrame:
-    history_path = STATIONS[airport]["history_path"]
-    url = build_history_url(history_path, dt_local)
-
-    print(f"  loading {url}")
-    driver.get(url)
-
-    ok = wait_for_table(driver)
-    if not ok:
-        raise RuntimeError("daily observations table did not render")
-
-    tables = pd.read_html(driver.page_source)
-    if not tables:
-        raise RuntimeError("no html tables found after render")
-
-    obs = None
-    for t in tables:
-        cols = [str(c).strip() for c in t.columns]
-        if "Time" in cols and "Temperature" in cols:
-            obs = t.copy()
-            break
-
-    if obs is None:
-        raise RuntimeError("could not find Daily Observations table")
-
-    obs.columns = [str(c).strip() for c in obs.columns]
-
-    obs["timestamp_local"] = obs["Time"].apply(lambda x: parse_time_to_timestamp_local(dt_local, x))
-    obs = obs[obs["timestamp_local"].notna()].copy()
-
-    obs["temp"] = obs["Temperature"].apply(parse_temp_c)
-    obs = obs[obs["temp"].notna()].copy()
-
-    keep_cols = ["timestamp_local", "temp"]
-    extra_cols = [c for c in ["Dew Point", "Humidity", "Wind", "Wind Speed", "Wind Gust", "Pressure", "Precip.", "Condition"] if c in obs.columns]
-    out = obs[keep_cols + extra_cols].copy()
-
-    out.insert(0, "airport", airport)
-    out.insert(1, "source", "wunderground_history")
-    out["date_local"] = dt_local.normalize()
-
-    return out.sort_values("timestamp_local").reset_index(drop=True)
-
-
-def add_timestamp_utc(df: pd.DataFrame) -> pd.DataFrame:
-    pieces = []
-    for airport, g in df.groupby("airport", sort=False):
-        tz_name = CITY_TO_TZ[airport]
-        x = g.copy()
-        ts_local = pd.to_datetime(x["timestamp_local"], errors="coerce")
-        ts_utc = ts_local.dt.tz_localize(tz_name, ambiguous="NaT", nonexistent="shift_forward").dt.tz_convert("UTC")
-        x["timestamp_utc"] = ts_utc.dt.tz_localize(None)
-        pieces.append(x)
-
-    out = pd.concat(pieces, ignore_index=True)
-    return out
-
-
-def main():
-    driver = make_driver()
-    frames = []
+def scrape_day(page, airport: str, path: str, tz: str, date_str: str) -> pd.DataFrame:
+    url = BASE_URL.format(path=path, date=date_str)
+    print(f"    GET {url}")
 
     try:
-        for airport in STATIONS:
-            print(f"Downloading {airport}")
+        page.goto(url, wait_until="networkidle", timeout=30_000)
+    except PWTimeout:
+        print(f"    ✗ page load timeout")
+        return pd.DataFrame()
 
-            tz_name = CITY_TO_TZ[airport]
-            now_local = pd.Timestamp.now(tz=tz_name)
+    # Wait for the observations table — try multiple selectors
+    table_found = False
+    for selector in ["table.observation-table", "lib-city-history-observation table", "table"]:
+        try:
+            page.wait_for_selector(selector, timeout=12_000)
+            table_found = True
+            break
+        except PWTimeout:
+            continue
 
-            for d in range(0, 3):
-                dt_local = (now_local.normalize() - pd.Timedelta(days=d))
-                try:
-                    day_df = scrape_daily_observations(driver, airport, dt_local)
-                    if day_df.empty:
-                        print(f"  {dt_local.date()}: no rows")
-                        continue
+    if not table_found:
+        print(f"    ✗ table not found (no data recorded?)")
+        return pd.DataFrame()
 
-                    frames.append(day_df)
-                    print(f"  {dt_local.date()}: kept {len(day_df):,} rows")
-                except Exception as e:
-                    print(f"  {dt_local.date()}: FAILED: {e}")
+    # Grab all table rows
+    rows = page.query_selector_all("table tr")
+    if not rows:
+        print(f"    ✗ no rows found")
+        return pd.DataFrame()
 
-    finally:
-        driver.quit()
+    records = []
+    for row in rows[1:]:  # skip header
+        cells = row.query_selector_all("td")
+        if len(cells) < 2:
+            continue
+        time_str = cells[0].inner_text().strip()
+        temp_str = cells[1].inner_text().strip()
 
-    if frames:
-        final = pd.concat(frames, ignore_index=True)
-        final = add_timestamp_utc(final)
-        final = final.sort_values(["airport", "timestamp_local"]).reset_index(drop=True)
+        temp = parse_temp(temp_str)
+        if temp is None:
+            continue
 
-        final = final.drop_duplicates(subset=["airport", "timestamp_local"], keep="last").reset_index(drop=True)
+        ts_local = parse_time_to_dt(time_str, date_str, tz)
+        if ts_local is None:
+            continue
 
-        ordered = ["airport", "source", "date_local", "timestamp_local", "timestamp_utc", "temp"]
-        others = [c for c in final.columns if c not in ordered]
-        final = final[ordered + others]
-    else:
-        final = pd.DataFrame(
-            columns=["airport", "source", "date_local", "timestamp_local", "timestamp_utc", "temp"]
-        )
+        ts_utc = ts_local.tz_convert("UTC")
 
-    final.to_parquet(OUTPUT_PATH, index=False)
-    print(f"\nSaved {len(final):,} rows -> {OUTPUT_PATH}")
+        records.append({
+            "airport":         airport,
+            "timestamp_utc":   ts_utc.tz_localize(None),
+            "timestamp_local": ts_local.tz_localize(None),
+            "temp":            temp,
+        })
+
+    df = pd.DataFrame(records)
+    print(f"    ✓ {len(df)} rows")
+    return df
 
 
-if __name__ == "__main__":
-    main()
+# ── Main ──────────────────────────────────────────────────────────────────────
+all_frames = []
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        locale="en-US",
+    )
+    page = context.new_page()
+    # Block images/fonts to speed things up
+    page.route("**/*.{png,jpg,jpeg,gif,webp,woff,woff2,ttf,svg}", lambda r: r.abort())
+
+    for airport, meta in STATIONS.items():
+        print(f"\n── {airport} ──")
+        airport_frames = []
+
+        for date_str in DATES:
+            df = scrape_day(page, airport, meta["url_path"], meta["tz"], date_str)
+            if not df.empty:
+                airport_frames.append(df)
+            time.sleep(2)  # polite pacing between requests
+
+        if airport_frames:
+            combined = pd.concat(airport_frames, ignore_index=True)
+            combined = combined.drop_duplicates(subset=["airport", "timestamp_local"])
+            combined = combined.sort_values("timestamp_local").reset_index(drop=True)
+            all_frames.append(combined)
+            print(f"  → {len(combined)} total rows for {airport}")
+        else:
+            print(f"  → no data collected for {airport}")
+
+    browser.close()
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+if all_frames:
+    final = pd.concat(all_frames, ignore_index=True)
+    final = final.sort_values(["airport", "timestamp_local"]).reset_index(drop=True)
+else:
+    final = pd.DataFrame(columns=["airport", "timestamp_utc", "timestamp_local", "temp"])
+
+final.to_parquet(OUTPUT_PATH, index=False)
+print(f"\n✓ Saved {len(final):,} rows → {OUTPUT_PATH}")
+print(f"  Airports : {sorted(final['airport'].unique().tolist())}")
+if not final.empty:
+    print(f"  Time range: {final['timestamp_local'].min()} → {final['timestamp_local'].max()}")
