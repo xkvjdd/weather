@@ -23,7 +23,7 @@ jobs:
 
       - name: Install packages
         run: |
-          pip install pandas pyarrow requests
+          pip install pandas pyarrow requests selenium lxml html5lib
 
       - name: Run backfill script
         run: |
