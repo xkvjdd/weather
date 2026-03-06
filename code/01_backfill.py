@@ -67,14 +67,25 @@ def parse_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     out = df.copy()
+    lower_cols = {str(c).lower(): c for c in out.columns}
 
-    if "time" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["time"], errors="coerce")
+    if "time" in lower_cols:
+        out["timestamp_utc"] = pd.to_datetime(out[lower_cols["time"]], errors="coerce", utc=True)
+
+    elif "date" in lower_cols and "hour" in lower_cols:
+        date_col = lower_cols["date"]
+        hour_col = lower_cols["hour"]
+        out["timestamp_utc"] = pd.to_datetime(
+            out[date_col].astype(str) + " " + out[hour_col].astype(str).str.zfill(2) + ":00:00",
+            errors="coerce",
+            utc=True,
+        )
+
     else:
         first_col = out.columns[0]
-        out["timestamp"] = pd.to_datetime(out[first_col], errors="coerce")
+        out["timestamp_utc"] = pd.to_datetime(out[first_col], errors="coerce", utc=True)
 
-    out = out[out["timestamp"].notna()].copy()
+    out = out[out["timestamp_utc"].notna()].copy()
     return out
 
 
@@ -95,25 +106,21 @@ for airport, meta in STATIONS.items():
             print("  empty after timestamp parse")
             continue
 
-        if "temp" not in df.columns:
-            print("  missing temp column")
-            continue
-
-        tz_name = CITY_TO_TZ[airport]
-
-        ts_utc_aware = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        df["timestamp_utc"] = ts_utc_aware.dt.tz_localize(None)
-        df["timestamp_local"] = ts_utc_aware.dt.tz_convert(tz_name).dt.tz_localize(None)
-
-        df = df[df["timestamp_utc"] >= CUT.tz_localize(None)].copy()
+        df = df[df["timestamp_utc"] >= CUT].copy()
         if df.empty:
             print("  no rows in last 96h")
             continue
 
+        if "temp" not in df.columns:
+            print(f"  missing temp column; cols={list(df.columns)}")
+            continue
+
+        tz_name = CITY_TO_TZ[airport]
+
         out = pd.DataFrame({
             "airport": airport,
-            "timestamp_utc": df["timestamp_utc"],
-            "timestamp_local": df["timestamp_local"],
+            "timestamp_utc": df["timestamp_utc"].dt.tz_localize(None),
+            "timestamp_local": df["timestamp_utc"].dt.tz_convert(tz_name).dt.tz_localize(None),
             "temp": pd.to_numeric(df["temp"], errors="coerce"),
         })
 
