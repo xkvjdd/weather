@@ -267,8 +267,7 @@ for airport in airports:
     s = airport_stats(airport, obs_df, model_df, forecast_df)
     with stat_col:
         st.subheader(airport)
-        st.markdown(f"**Current temp**  
-{fmt_num(s['current_temp'])}")
+        st.markdown(f"**Current temp**  \n{fmt_num(s['current_temp'])}")
         st.markdown(
             f"**Modelled max**  
 {fmt_num(s['model_now'])}  
@@ -288,12 +287,8 @@ S3: {fmt_num(s['fc3'])}
             unsafe_allow_html=True,
         )
         st.markdown("**Last updated**")
-        st.caption(
-            f"Obs: {fmt_ts(s['obs_updated'])}
+        st.caption(f"Obs: {fmt_ts(s['obs_updated'])}
 
-"
-            f"Model: {fmt_ts(s['model_updated'])}
+Model: {fmt_ts(s['model_updated'])}
 
-"
-            f"Forecast: {fmt_ts(s['fc_updated'])}"
-        )
+Forecast: {fmt_ts(s['fc_updated'])}")
