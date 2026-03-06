@@ -1,7 +1,7 @@
 name: Backfill Observations
 
 on:
-  workflow_dispatch:   # run manually once from GitHub UI
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -9,6 +9,7 @@ permissions:
 jobs:
   backfill:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,12 +23,7 @@ jobs:
 
       - name: Install packages
         run: |
-          pip install pandas pyarrow playwright
-
-      - name: Install Chromium
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
+          pip install pandas pyarrow selenium
 
       - name: Run backfill script
         run: |
