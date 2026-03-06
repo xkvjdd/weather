@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Weather Max Dashboard", layout="wide")
 
-DATA_DIR = r"C:\Users\Ho On Tam\Desktop\bot\weather\data\dashboard"
+DATA_DIR = "data/dashboard"
 OBS_PATH = os.path.join(DATA_DIR, "observations.parquet")
 MODEL_PATH = os.path.join(DATA_DIR, "model_history.parquet")
 FORECAST_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
