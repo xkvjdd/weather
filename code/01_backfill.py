@@ -1,131 +1,205 @@
-"""
-fetch_observations.py
-─────────────────────
-Fetches the last 3 days of hourly temperature observations for each airport
-using the Open-Meteo Historical Forecast API (free, no API key required).
-
-Data is already in local time (Open-Meteo returns local timestamps when
-timezone is specified).
-
-Output: data/dashboard/observations.parquet
-Columns: airport | timestamp_utc | timestamp_local | temp
-"""
-
 import os
 import time
-import requests
-import pandas as pd
+from datetime import datetime, timedelta
 
-# ── Airport config ────────────────────────────────────────────────────────────
-# lat/lon sourced from standard airport coordinates
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
 STATIONS = {
-    "ATL": {"lat": 33.6407,  "lon": -84.4277,  "tz": "America/New_York"},
-    "NYC": {"lat": 40.7772,  "lon": -73.8726,  "tz": "America/New_York"},
-    "CHI": {"lat": 41.9742,  "lon": -87.9073,  "tz": "America/Chicago"},
-    "DAL": {"lat": 32.8481,  "lon": -96.8512,  "tz": "America/Chicago"},
-    "SEA": {"lat": 47.4502,  "lon": -122.3088, "tz": "America/Los_Angeles"},
-    "MIA": {"lat": 25.7959,  "lon": -80.2870,  "tz": "America/New_York"},
-    "TOR": {"lat": 43.6777,  "lon": -79.6248,  "tz": "America/Toronto"},
-    "PAR": {"lat": 49.0097,  "lon":   2.5479,  "tz": "Europe/Paris"},
-    "SEL": {"lat": 37.4691,  "lon": 126.4510,  "tz": "Asia/Seoul"},
-    "ANK": {"lat": 40.1281,  "lon":  32.9951,  "tz": "Europe/Istanbul"},
-    "BUE": {"lat": -34.8222, "lon": -58.5358,  "tz": "America/Argentina/Buenos_Aires"},
-    "LON": {"lat": 51.4775,  "lon":  -0.4614,  "tz": "Europe/London"},
-    "WLG": {"lat": -41.3272, "lon": 174.8052,  "tz": "Pacific/Auckland"},
+    "ATL": {"icao": "KATL", "history_path": "us/ga/atlanta/KATL"},
+    "NYC": {"icao": "KLGA", "history_path": "us/ny/new-york/KLGA"},
+    "CHI": {"icao": "KORD", "history_path": "us/il/chicago/KORD"},
+    "DAL": {"icao": "KDAL", "history_path": "us/tx/dallas/KDAL"},
+    "SEA": {"icao": "KSEA", "history_path": "us/wa/seattle/KSEA"},
+    "MIA": {"icao": "KMIA", "history_path": "us/fl/miami/KMIA"},
+    "TOR": {"icao": "CYYZ", "history_path": "ca/on/toronto/CYYZ"},
+    "PAR": {"icao": "LFPG", "history_path": "fr/paris/LFPG"},
+    "SEL": {"icao": "RKSI", "history_path": "kr/incheon/RKSI"},
+    "ANK": {"icao": "LTAC", "history_path": "tr/ankara/LTAC"},
+    "BUE": {"icao": "SAEZ", "history_path": "ar/buenos-aires/SAEZ"},
+    "LON": {"icao": "EGLL", "history_path": "gb/england/london/EGLL"},
+    "WLG": {"icao": "NZWN", "history_path": "nz/wellington/NZWN"},
 }
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+CITY_TO_TZ = {
+    "ATL": "America/New_York",
+    "NYC": "America/New_York",
+    "CHI": "America/Chicago",
+    "DAL": "America/Chicago",
+    "SEA": "America/Los_Angeles",
+    "MIA": "America/New_York",
+    "TOR": "America/Toronto",
+    "PAR": "Europe/Paris",
+    "SEL": "Asia/Seoul",
+    "ANK": "Europe/Istanbul",
+    "BUE": "America/Argentina/Buenos_Aires",
+    "LON": "Europe/London",
+    "WLG": "Pacific/Auckland",
+}
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
-DATA_DIR   = os.path.join(REPO_ROOT, "data", "dashboard")
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+DATA_DIR = os.path.join(REPO_ROOT, "data", "dashboard")
 os.makedirs(DATA_DIR, exist_ok=True)
+
 OUTPUT_PATH = os.path.join(DATA_DIR, "observations.parquet")
 
-# ── Date range: today and previous 2 days (3 days total) ─────────────────────
-NOW       = pd.Timestamp.now("UTC")
-END_DATE  = NOW.strftime("%Y-%m-%d")
-START_DATE = (NOW - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
 
-BASE_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-
-TIMEOUT = 30
-RETRY_WAIT = 5   # seconds between retries on rate-limit
-
-
-def fetch_airport(airport: str, meta: dict) -> pd.DataFrame:
-    params = {
-        "latitude":        meta["lat"],
-        "longitude":       meta["lon"],
-        "start_date":      START_DATE,
-        "end_date":        END_DATE,
-        "hourly":          "temperature_2m",
-        "timezone":        meta["tz"],
-        "temperature_unit": "celsius",
-    }
-
-    for attempt in range(3):
-        resp = requests.get(BASE_URL, params=params, timeout=TIMEOUT)
-        if resp.status_code == 429:
-            print(f"  rate-limited, waiting {RETRY_WAIT}s …")
-            time.sleep(RETRY_WAIT)
-            continue
-        resp.raise_for_status()
-        break
-
-    data = resp.json()
-
-    hourly  = data.get("hourly", {})
-    times   = hourly.get("time", [])
-    temps   = hourly.get("temperature_2m", [])
-
-    if not times:
-        print(f"  no hourly data returned")
-        return pd.DataFrame()
-
-    df = pd.DataFrame({"timestamp_local_str": times, "temp": temps})
-    df = df[df["temp"].notna()].copy()
-
-    # Parse local timestamp (Open-Meteo returns ISO strings in the requested tz)
-    df["timestamp_local"] = pd.to_datetime(df["timestamp_local_str"])
-
-    # Derive UTC
-    local_tz = meta["tz"]
-    df["timestamp_utc"] = (
-        df["timestamp_local"]
-        .dt.tz_localize(local_tz, ambiguous="NaT", nonexistent="NaT")
-        .dt.tz_convert("UTC")
-        .dt.tz_localize(None)
+def make_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1600,2200")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
     )
-    df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(None)
-    df["airport"] = airport
-
-    return df[["airport", "timestamp_utc", "timestamp_local", "temp"]].sort_values("timestamp_local").reset_index(drop=True)
+    return webdriver.Chrome(options=options)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-frames = []
+def build_history_url(history_path: str, dt_local: pd.Timestamp) -> str:
+    date_str = f"{dt_local.year}-{dt_local.month}-{dt_local.day}"
+    return f"https://www.wunderground.com/history/daily/{history_path}/date/{date_str}"
 
-for airport, meta in STATIONS.items():
-    print(f"Fetching {airport} ({meta['tz']})  {START_DATE} → {END_DATE}")
+
+def wait_for_table(driver: webdriver.Chrome, timeout: int = 25) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        html = driver.page_source
+        if "Daily Observations" in html and "<table" in html:
+            return True
+        time.sleep(1)
+    return False
+
+
+def parse_temp_c(value) -> float | None:
+    if pd.isna(value):
+        return None
+    s = str(value).replace("°C", "").replace("°", "").strip()
     try:
-        df = fetch_airport(airport, meta)
-        if df.empty:
-            print(f"  ✗ no data")
-        else:
-            print(f"  ✓ {len(df):,} rows  (latest: {df['timestamp_local'].max()})")
-            frames.append(df)
-    except Exception as e:
-        print(f"  ✗ FAILED: {e}")
+        return float(s)
+    except Exception:
+        return None
 
-    time.sleep(0.5)   # polite pacing between airports
 
-if frames:
-    final = pd.concat(frames, ignore_index=True)
-    final = final.sort_values(["airport", "timestamp_local"]).reset_index(drop=True)
-else:
-    final = pd.DataFrame(columns=["airport", "timestamp_utc", "timestamp_local", "temp"])
+def parse_time_to_timestamp_local(date_local: pd.Timestamp, time_str: str) -> pd.Timestamp | None:
+    try:
+        dt = pd.to_datetime(f"{date_local.strftime('%Y-%m-%d')} {time_str}", format="%Y-%m-%d %I:%M %p")
+        return dt
+    except Exception:
+        try:
+            return pd.to_datetime(f"{date_local.strftime('%Y-%m-%d')} {time_str}")
+        except Exception:
+            return None
 
-final.to_parquet(OUTPUT_PATH, index=False)
-print(f"\n✓ Saved {len(final):,} rows → {OUTPUT_PATH}")
-print(f"  Airports: {sorted(final['airport'].unique().tolist())}")
-print(f"  Time range: {final['timestamp_local'].min()} → {final['timestamp_local'].max()}")
+
+def scrape_daily_observations(driver: webdriver.Chrome, airport: str, dt_local: pd.Timestamp) -> pd.DataFrame:
+    history_path = STATIONS[airport]["history_path"]
+    url = build_history_url(history_path, dt_local)
+
+    print(f"  loading {url}")
+    driver.get(url)
+
+    ok = wait_for_table(driver)
+    if not ok:
+        raise RuntimeError("daily observations table did not render")
+
+    tables = pd.read_html(driver.page_source)
+    if not tables:
+        raise RuntimeError("no html tables found after render")
+
+    obs = None
+    for t in tables:
+        cols = [str(c).strip() for c in t.columns]
+        if "Time" in cols and "Temperature" in cols:
+            obs = t.copy()
+            break
+
+    if obs is None:
+        raise RuntimeError("could not find Daily Observations table")
+
+    obs.columns = [str(c).strip() for c in obs.columns]
+
+    obs["timestamp_local"] = obs["Time"].apply(lambda x: parse_time_to_timestamp_local(dt_local, x))
+    obs = obs[obs["timestamp_local"].notna()].copy()
+
+    obs["temp"] = obs["Temperature"].apply(parse_temp_c)
+    obs = obs[obs["temp"].notna()].copy()
+
+    keep_cols = ["timestamp_local", "temp"]
+    extra_cols = [c for c in ["Dew Point", "Humidity", "Wind", "Wind Speed", "Wind Gust", "Pressure", "Precip.", "Condition"] if c in obs.columns]
+    out = obs[keep_cols + extra_cols].copy()
+
+    out.insert(0, "airport", airport)
+    out.insert(1, "source", "wunderground_history")
+    out["date_local"] = dt_local.normalize()
+
+    return out.sort_values("timestamp_local").reset_index(drop=True)
+
+
+def add_timestamp_utc(df: pd.DataFrame) -> pd.DataFrame:
+    pieces = []
+    for airport, g in df.groupby("airport", sort=False):
+        tz_name = CITY_TO_TZ[airport]
+        x = g.copy()
+        ts_local = pd.to_datetime(x["timestamp_local"], errors="coerce")
+        ts_utc = ts_local.dt.tz_localize(tz_name, ambiguous="NaT", nonexistent="shift_forward").dt.tz_convert("UTC")
+        x["timestamp_utc"] = ts_utc.dt.tz_localize(None)
+        pieces.append(x)
+
+    out = pd.concat(pieces, ignore_index=True)
+    return out
+
+
+def main():
+    driver = make_driver()
+    frames = []
+
+    try:
+        for airport in STATIONS:
+            print(f"Downloading {airport}")
+
+            tz_name = CITY_TO_TZ[airport]
+            now_local = pd.Timestamp.now(tz=tz_name)
+
+            for d in range(0, 3):
+                dt_local = (now_local.normalize() - pd.Timedelta(days=d))
+                try:
+                    day_df = scrape_daily_observations(driver, airport, dt_local)
+                    if day_df.empty:
+                        print(f"  {dt_local.date()}: no rows")
+                        continue
+
+                    frames.append(day_df)
+                    print(f"  {dt_local.date()}: kept {len(day_df):,} rows")
+                except Exception as e:
+                    print(f"  {dt_local.date()}: FAILED: {e}")
+
+    finally:
+        driver.quit()
+
+    if frames:
+        final = pd.concat(frames, ignore_index=True)
+        final = add_timestamp_utc(final)
+        final = final.sort_values(["airport", "timestamp_local"]).reset_index(drop=True)
+
+        final = final.drop_duplicates(subset=["airport", "timestamp_local"], keep="last").reset_index(drop=True)
+
+        ordered = ["airport", "source", "date_local", "timestamp_local", "timestamp_utc", "temp"]
+        others = [c for c in final.columns if c not in ordered]
+        final = final[ordered + others]
+    else:
+        final = pd.DataFrame(
+            columns=["airport", "source", "date_local", "timestamp_local", "timestamp_utc", "temp"]
+        )
+
+    final.to_parquet(OUTPUT_PATH, index=False)
+    print(f"\nSaved {len(final):,} rows -> {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
