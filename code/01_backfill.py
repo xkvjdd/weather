@@ -19,6 +19,22 @@ STATIONS = {
     "WLG": {"icao": "NZWN", "meteostat_id": "93436"},
 }
 
+CITY_TO_TZ = {
+    "ATL": "America/New_York",
+    "NYC": "America/New_York",
+    "CHI": "America/Chicago",
+    "DAL": "America/Chicago",
+    "SEA": "America/Los_Angeles",
+    "MIA": "America/New_York",
+    "TOR": "America/Toronto",
+    "PAR": "Europe/Paris",
+    "SEL": "Asia/Seoul",
+    "ANK": "Europe/Istanbul",
+    "BUE": "America/Argentina/Buenos_Aires",
+    "LON": "Europe/London",
+    "WLG": "Pacific/Auckland",
+}
+
 BASE_URL = "https://data.meteostat.net/hourly/{year}/{station}.csv.gz"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Python requests"
 TIMEOUT = 60
@@ -50,15 +66,15 @@ def parse_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    if "time" in df.columns:
-        ts = pd.to_datetime(df["time"], errors="coerce", utc=True)
-    else:
-        first_col = df.columns[0]
-        ts = pd.to_datetime(df[first_col], errors="coerce", utc=True)
-
     out = df.copy()
-    out["timestamp_utc"] = ts
-    out = out[out["timestamp_utc"].notna()].copy()
+
+    if "time" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["time"], errors="coerce")
+    else:
+        first_col = out.columns[0]
+        out["timestamp"] = pd.to_datetime(out[first_col], errors="coerce")
+
+    out = out[out["timestamp"].notna()].copy()
     return out
 
 
@@ -79,18 +95,25 @@ for airport, meta in STATIONS.items():
             print("  empty after timestamp parse")
             continue
 
-        df = df[df["timestamp_utc"] >= CUT].copy()
-        if df.empty:
-            print("  no rows in last 96h")
-            continue
-
         if "temp" not in df.columns:
             print("  missing temp column")
             continue
 
+        tz_name = CITY_TO_TZ[airport]
+
+        ts_utc_aware = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        df["timestamp_utc"] = ts_utc_aware.dt.tz_localize(None)
+        df["timestamp_local"] = ts_utc_aware.dt.tz_convert(tz_name).dt.tz_localize(None)
+
+        df = df[df["timestamp_utc"] >= CUT.tz_localize(None)].copy()
+        if df.empty:
+            print("  no rows in last 96h")
+            continue
+
         out = pd.DataFrame({
             "airport": airport,
-            "timestamp_local": df["timestamp_utc"].dt.tz_convert(None),
+            "timestamp_utc": df["timestamp_utc"],
+            "timestamp_local": df["timestamp_local"],
             "temp": pd.to_numeric(df["temp"], errors="coerce"),
         })
 
@@ -105,7 +128,7 @@ if frames:
     final = pd.concat(frames, ignore_index=True)
     final = final.sort_values(["airport", "timestamp_local"]).reset_index(drop=True)
 else:
-    final = pd.DataFrame(columns=["airport", "timestamp_local", "temp"])
+    final = pd.DataFrame(columns=["airport", "timestamp_utc", "timestamp_local", "temp"])
 
 final.to_parquet(OUTPUT_PATH, index=False)
 
