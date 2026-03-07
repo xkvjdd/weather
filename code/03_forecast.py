@@ -8,10 +8,6 @@ import requests
 from bs4 import BeautifulSoup
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 MAX_WORKERS = 16
 TIMEOUT = 12
 
@@ -40,7 +36,7 @@ AIRPORT_META = {
     "WLG": {"name": "Wellington Airport", "tz": "Pacific/Auckland"},
 }
 
-# Fill these with your exact final working URLs.
+# Fill with your final exact links
 # S1 = AccuWeather
 # S2 = BBC
 # S3 = Weather.com
@@ -60,14 +56,14 @@ AIRPORT_LINKS = {
     "SEL": {"S1": "", "S2": "", "S3": ""},
     "ANK": {"S1": "", "S2": "", "S3": ""},
     "BUE": {"S1": "", "S2": "", "S3": ""},
-    "LON": {"S1": "", "S2": "", "S3": ""},
+    "LON": {
+        "S1": "https://www.accuweather.com/en/gb/london-heathrow-airport/tw6-2/weather-forecast/5346_poi",
+        "S2": "",
+        "S3": "https://weather.com/weather/tenday/l/92bcee466601fa8f3d322d6622fb528856f2fb4c2c12dbc52f91dd44e533ee5a",
+    },
     "WLG": {"S1": "", "S2": "", "S3": ""},
 }
 
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -101,7 +97,7 @@ def make_session() -> requests.Session:
     return s
 
 
-def fetch_text(session: requests.Session, url: str) -> tuple[str | None, str | None]:
+def fetch_text(session: requests.Session, url: str):
     if not url:
         return None, "blank_url"
     try:
@@ -113,48 +109,45 @@ def fetch_text(session: requests.Session, url: str) -> tuple[str | None, str | N
 
 
 # ============================================================
-# S1 ACCUWEATHER PARSER
-# Based on your first screenshot:
-# a.daily-list-item -> div.temp -> span.temp-hi
+# S1 ACCUWEATHER
+# FIX: take TODAY'S WEATHER card high, not 10-day list
+# Screenshot target:
+# div.today-forecast-card ... <p>Low clouds</p> <b>Hi: 12°</b>
 # ============================================================
 
 def parse_accuweather_today_high(code: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # Best case: first daily list item marked TODAY row
-    items = soup.select("a.daily-list-item")
-    for item in items:
-        row_text = clean_text(item.get_text(" ", strip=True)).lower()
-
-        hi = item.select_one("div.temp span.temp-hi")
-        if hi:
-            hi_val = first_int(hi.get_text(" ", strip=True))
-            if hi_val is not None:
-                # Prefer row that clearly says Today first
-                if "today" in row_text:
-                    return {
-                        "temp_c": hi_val,
-                        "temp_f": c_to_f(hi_val),
-                        "method": "accuweather_daily_list_today",
-                    }
-
-    # Fallback: first daily-list-item high
-    for item in items:
-        hi = item.select_one("div.temp span.temp-hi")
-        if hi:
-            hi_val = first_int(hi.get_text(" ", strip=True))
-            if hi_val is not None:
+    # 1) Exact today card target
+    cards = soup.select("div.today-forecast-card")
+    for idx, card in enumerate(cards):
+        b_tags = card.select("b")
+        for b in b_tags:
+            txt = clean_text(b.get_text(" ", strip=True))
+            m = re.search(r"\bHi\s*:\s*(-?\d+)", txt, flags=re.I)
+            if m:
+                c = int(m.group(1))
                 return {
-                    "temp_c": hi_val,
-                    "temp_f": c_to_f(hi_val),
-                    "method": "accuweather_daily_list_first",
+                    "temp_c": c,
+                    "temp_f": c_to_f(c),
+                    "method": f"accuweather_today_card_b_{idx}",
                 }
 
-    # Fallback regex on raw HTML
+        card_text = clean_text(card.get_text(" ", strip=True))
+        m = re.search(r"\bHi\s*:\s*(-?\d+)", card_text, flags=re.I)
+        if m:
+            c = int(m.group(1))
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": f"accuweather_today_card_text_{idx}",
+            }
+
+    # 2) Backup: look for TODAY'S WEATHER block in raw HTML
     raw_patterns = [
-        r'<span class="temp-hi">(-?\d+)<',
-        r'"temp-hi"[^>]*>\s*(-?\d+)\s*<',
-        r'\bToday\b.{0,250}?(-?\d+)\s*[°º]',
+        r'today-forecast-card.*?\bHi\s*:\s*(-?\d+)',
+        r"\bTODAY'S WEATHER\b.{0,500}?\bHi\s*:\s*(-?\d+)",
+        r"\bHi\s*:\s*(-?\d+)\s*°",
     ]
     for i, patt in enumerate(raw_patterns, start=1):
         m = re.search(patt, html, flags=re.I | re.S)
@@ -170,7 +163,7 @@ def parse_accuweather_today_high(code: str, html: str):
 
 
 # ============================================================
-# S2 BBC PARSER
+# S2 BBC
 # Leave as-is
 # ============================================================
 
@@ -201,54 +194,52 @@ def parse_bbc_today_high(code: str, html: str):
 
 
 # ============================================================
-# S3 WEATHER.COM PARSER
-# Based on your second screenshot:
-# div[data-testid="DailyContent"]
-# span[data-testid="TemperatureValue"]
+# S3 WEATHER.COM
+# FIX: take expanded Today DailyContent TemperatureValue
+# Screenshot target:
+# div[data-testid="DailyContent"] > span[data-testid="TemperatureValue"] = 11
 # ============================================================
 
 def parse_weathercom_today_high(code: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # Best case: first expanded DailyContent / Today block
-    daily_blocks = soup.select('div[data-testid="DailyContent"]')
-    for idx, block in enumerate(daily_blocks):
+    # 1) Exact expanded Today block
+    for idx, block in enumerate(soup.select('div[data-testid="DailyContent"]')):
         temp_span = block.select_one('span[data-testid="TemperatureValue"]')
         if temp_span:
-            temp_f = first_int(temp_span.get_text(" ", strip=True))
-            if temp_f is not None:
+            temp_val = first_int(temp_span.get_text(" ", strip=True))
+            if temp_val is not None:
                 return {
-                    "temp_c": f_to_c(temp_f),
-                    "temp_f": temp_f,
+                    "temp_c": temp_val,   # your screenshot is in °C
+                    "temp_f": c_to_f(temp_val),
                     "method": f"weathercom_dailycontent_{idx}",
                 }
 
-    # Next fallback: disclosure summary area
-    summaries = soup.select('summary[data-testid="Disclosure-Summary"]')
-    for idx, summ in enumerate(summaries):
+    # 2) Disclosure summary fallback
+    for idx, summ in enumerate(soup.select('summary[data-testid="Disclosure-Summary"]')):
         temp_span = summ.select_one('span[data-testid="TemperatureValue"]')
         if temp_span:
-            temp_f = first_int(temp_span.get_text(" ", strip=True))
-            if temp_f is not None:
+            temp_val = first_int(temp_span.get_text(" ", strip=True))
+            if temp_val is not None:
                 return {
-                    "temp_c": f_to_c(temp_f),
-                    "temp_f": temp_f,
+                    "temp_c": temp_val,
+                    "temp_f": c_to_f(temp_val),
                     "method": f"weathercom_summary_{idx}",
                 }
 
-    # Raw regex fallback from HTML
+    # 3) Raw HTML fallback
     raw_patterns = [
-        r'data-testid="TemperatureValue"[^>]*>\s*(-?\d+)\s*°?',
-        r'"temperature":\s*(-?\d+)',
-        r'\bToday\b.{0,250}?(-?\d+)\s*°',
+        r'data-testid="DailyContent".{0,600}?data-testid="TemperatureValue"[^>]*>\s*(-?\d+)',
+        r'data-testid="TemperatureValue"[^>]*>\s*(-?\d+)\s*<',
+        r'\bToday\b.{0,300}?(-?\d+)\s*°',
     ]
     for i, patt in enumerate(raw_patterns, start=1):
         m = re.search(patt, html, flags=re.I | re.S)
         if m:
-            f = int(m.group(1))
+            c = int(m.group(1))
             return {
-                "temp_c": f_to_c(f),
-                "temp_f": f,
+                "temp_c": c,
+                "temp_f": c_to_f(c),
                 "method": f"weathercom_regex_{i}",
             }
 
@@ -264,10 +255,6 @@ def parse_source(code: str, source: str, html: str):
         return parse_weathercom_today_high(code, html)
     return None
 
-
-# ============================================================
-# WORKERS
-# ============================================================
 
 def fetch_one(session: requests.Session, code: str, source: str, url: str):
     html, err = fetch_text(session, url)
@@ -356,10 +343,6 @@ def process_all():
 
     return list(results.values())
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     rows = process_all()
