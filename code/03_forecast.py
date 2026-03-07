@@ -136,6 +136,26 @@ def first_int(text: str):
     return int(m.group()) if m else None
 
 
+def infer_accuweather_unit(code: str, final_url: str, text: str = "") -> str:
+    code = (code or "").upper()
+    final_url = (final_url or "").lower()
+    text = (text or "").lower()
+
+    # Based on actual results observed from these airport pages
+    if code in {"ATL", "NYC", "CHI", "DAL", "SEA", "MIA", "BUE", "LON", "WLG"}:
+        return "F"
+
+    # US pages default to Fahrenheit
+    if "/en/us/" in final_url:
+        return "F"
+
+    # Explicit signal if page text ever contains Fahrenheit wording
+    if "fahrenheit" in text or "°f" in text:
+        return "F"
+
+    return "C"
+
+
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -158,7 +178,7 @@ def fetch_text(session: requests.Session, url: str):
 
 def make_edge_driver() -> webdriver.Edge:
     opts = webdriver.EdgeOptions()
-    opts.add_argument("--headless")
+    opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -172,7 +192,7 @@ def make_edge_driver() -> webdriver.Edge:
     opts.add_experimental_option("useAutomationExtension", False)
 
     driver = webdriver.Edge(options=opts)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(25)
     driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
     return driver
 
@@ -186,7 +206,7 @@ def fetch_weathercom_selenium(url: str):
         driver = make_edge_driver()
         driver.get(url)
 
-        WebDriverWait(driver, 20).until(
+        WebDriverWait(driver, 12).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="TemperatureValue"]'))
         )
 
@@ -207,47 +227,49 @@ def fetch_weathercom_selenium(url: str):
 # S1 ACCUWEATHER
 # ============================================================
 
-def parse_accuweather_today_high(code: str, html: str):
+def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
     soup = BeautifulSoup(html, "html.parser")
+
+    def build_result(temp_raw: int, method: str, match_text: str):
+        unit = infer_accuweather_unit(code, final_url or "", match_text)
+        if unit == "F":
+            return {
+                "temp_f": float(temp_raw),
+                "temp_c": f_to_c(temp_raw),
+                "method": method,
+                "match_text": match_text[:300],
+            }
+        return {
+            "temp_c": float(temp_raw),
+            "temp_f": c_to_f(temp_raw),
+            "method": method,
+            "match_text": match_text[:300],
+        }
 
     # 1) Best path: 10-day list row high temp span
     for idx, row in enumerate(soup.select("a.daily-list-item")):
         hi = row.select_one("span.temp-hi")
         if hi:
-            c = first_int(hi.get_text(" ", strip=True))
-            if c is not None:
+            temp_raw = first_int(hi.get_text(" ", strip=True))
+            if temp_raw is not None:
                 row_text = clean_text(row.get_text(" ", strip=True))
-                return {
-                    "temp_c": c,
-                    "temp_f": c_to_f(c),
-                    "method": f"accuweather_daily_list_temp_hi_{idx}",
-                    "match_text": row_text[:300],
-                }
+                return build_result(temp_raw, f"accuweather_daily_list_temp_hi_{idx}", row_text)
 
     # 2) Today's weather card text like "Hi: 28°"
     for idx, card in enumerate(soup.select("div.today-forecast-card")):
         txt = clean_text(card.get_text(" ", strip=True))
         m = re.search(r"\bHi\s*:\s*(-?\d+)", txt, flags=re.I)
         if m:
-            c = int(m.group(1))
-            return {
-                "temp_c": c,
-                "temp_f": c_to_f(c),
-                "method": f"accuweather_today_card_{idx}",
-                "match_text": txt[:300],
-            }
+            temp_raw = int(m.group(1))
+            return build_result(temp_raw, f"accuweather_today_card_{idx}", txt)
 
     # 3) Generic span fallback
     hi = soup.select_one("span.temp-hi")
     if hi:
-        c = first_int(hi.get_text(" ", strip=True))
-        if c is not None:
-            return {
-                "temp_c": c,
-                "temp_f": c_to_f(c),
-                "method": "accuweather_span_temp_hi",
-                "match_text": clean_text(hi.get_text(" ", strip=True)),
-            }
+        temp_raw = first_int(hi.get_text(" ", strip=True))
+        if temp_raw is not None:
+            txt = clean_text(hi.get_text(" ", strip=True))
+            return build_result(temp_raw, "accuweather_span_temp_hi", txt)
 
     # 4) Raw HTML fallback
     raw_patterns = [
@@ -257,13 +279,8 @@ def parse_accuweather_today_high(code: str, html: str):
     for i, patt in enumerate(raw_patterns, start=1):
         m = re.search(patt, html, flags=re.I | re.S)
         if m:
-            c = int(m.group(1))
-            return {
-                "temp_c": c,
-                "temp_f": c_to_f(c),
-                "method": f"accuweather_regex_{i}",
-                "match_text": m.group(0)[:300],
-            }
+            temp_raw = int(m.group(1))
+            return build_result(temp_raw, f"accuweather_regex_{i}", m.group(0))
 
     return None
 
@@ -356,9 +373,9 @@ def parse_weathercom_today_high(code: str, html: str):
     return None
 
 
-def parse_source(code: str, source: str, html: str):
+def parse_source(code: str, source: str, html: str, final_url: str = None):
     if source == "S1":
-        return parse_accuweather_today_high(code, html)
+        return parse_accuweather_today_high(code, html, final_url)
     if source == "S2":
         return parse_bbc_today_high(code, html)
     if source == "S3":
@@ -412,7 +429,7 @@ def fetch_one_http(session: requests.Session, code: str, source: str, url: str):
             "match_text": None,
         }
 
-    parsed = parse_source(code, source, html)
+    parsed = parse_source(code, source, html, final_url)
     if not parsed:
         return {
             "code": code,
@@ -458,7 +475,7 @@ def fetch_one_selenium(code: str, source: str, url: str):
             "match_text": None,
         }
 
-    parsed = parse_source(code, source, html)
+    parsed = parse_source(code, source, html, final_url)
     if not parsed:
         return {
             "code": code,
