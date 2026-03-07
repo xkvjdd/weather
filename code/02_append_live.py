@@ -199,9 +199,13 @@ def main() -> None:
         return
 
     new_df = pd.DataFrame(rows, columns=["airport", "timestamp_local", "temp"])
-    existing = load_existing(OUTPUT_PATH)
 
-    combined = pd.concat([existing, new_df], ignore_index=True)
+    if not os.path.exists(OUTPUT_PATH):
+        combined = new_df.copy()
+    else:
+        existing = load_existing(OUTPUT_PATH)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+
     combined["timestamp_local"] = pd.to_datetime(combined["timestamp_local"], errors="coerce")
     combined["temp"] = pd.to_numeric(combined["temp"], errors="coerce")
 
