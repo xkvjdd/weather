@@ -335,23 +335,26 @@ def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    if "forecast_date_local" not in df.columns:
-        print("  Existing parquet missing forecast_date_local; dropping old existing rows")
+    if "forecast_date_local" not in df.columns or "airport" not in df.columns:
+        print("  Existing parquet missing key columns; dropping old existing rows")
         return pd.DataFrame(columns=FORECAST_COLS)
 
-    if "airport" not in df.columns:
-        print("  Existing parquet missing airport; dropping old existing rows")
-        return pd.DataFrame(columns=FORECAST_COLS)
-
+    # Force missing values to False so the mask is always pure boolean
     keep_mask = df.apply(
-        lambda row: row["forecast_date_local"] == today_local_str(
-            AIRPORTS.get(row["airport"], {}).get("tz", "UTC")
+        lambda row: (
+            pd.notna(row["forecast_date_local"]) and
+            pd.notna(row["airport"]) and
+            row["forecast_date_local"] == today_local_str(
+                AIRPORTS.get(str(row["airport"]), {}).get("tz", "UTC")
+            )
         ),
         axis=1,
-    )
+    ).fillna(False).astype(bool)
+
     dropped = int((~keep_mask).sum())
     if dropped:
-        print(f"  Purged {dropped} row(s) from previous local days")
+        print(f"  Purged {dropped} row(s) from previous local days / bad legacy rows")
+
     return df.loc[keep_mask].reset_index(drop=True)
 
 
