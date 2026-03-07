@@ -1,9 +1,9 @@
 # Requirements: requests, pandas, pyarrow, selenium, webdriver-manager, beautifulsoup4
 
 import os
-import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -59,9 +59,11 @@ OUTPUT_PATH        = os.path.join(DATA_DIR, "forecast_latest.parquet")
 OBSERVATIONS_PATH  = os.path.join(DATA_DIR, "observations.parquet")
 OBSERVATIONS_COPY  = os.path.join(DATA_DIR, "observations_copy.parquet")
 
-HTTP_TIMEOUT  = 30
-SLEEP_SECONDS = 0.5
-PAGE_TIMEOUT  = 20
+HTTP_TIMEOUT  = 20
+PAGE_TIMEOUT  = 15
+
+# Install ChromeDriver once before threads start — avoids concurrent installs
+CHROMEDRIVER_PATH = ChromeDriverManager().install()
 
 HEADERS_API = {
     "User-Agent": "airport-weather-dashboard/1.0 (research; contact via github)"
@@ -115,10 +117,7 @@ def max_ignore_none(a: float | None, b: float | None) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot observations.parquet -> observations_copy.parquet at startup.
-# All reads this run use the copy, so a concurrent workflow run writing to
-# observations.parquet mid-flight cannot corrupt our observed_max values.
-# The copy is deleted in the finally block of main().
+# Observations snapshot — copy once at startup, read copy throughout
 # ---------------------------------------------------------------------------
 
 def snapshot_observations() -> None:
@@ -135,38 +134,28 @@ def cleanup_observations_copy() -> None:
         print(f"Deleted observations copy: {OBSERVATIONS_COPY}")
 
 
-# ---------------------------------------------------------------------------
-# Observed max today — reads from observations_copy.parquet (stable snapshot)
-# ---------------------------------------------------------------------------
-
 def load_observed_max_today(airport: str, tz_name: str) -> float | None:
     if not os.path.exists(OBSERVATIONS_COPY):
-        print(f"    WARNING: observations_copy.parquet not found, skipping observed max.")
         return None
-
     try:
-        obs = pd.read_parquet(OBSERVATIONS_COPY)
+        obs   = pd.read_parquet(OBSERVATIONS_COPY)
+        today = today_local_str(tz_name)
+        mask  = (
+            (obs["airport"] == airport) &
+            (obs["timestamp_local"].astype(str).str[:10] == today)
+        )
+        todays = obs.loc[mask, "temp"].dropna()
+        if todays.empty:
+            print(f"    [{airport}] WARNING: no observations for {today}")
+            return None
+        return round(float(todays.max()), 3)
     except Exception as e:
-        print(f"    WARNING: could not read observations_copy.parquet: {e}")
+        print(f"    [{airport}] WARNING: could not read observations_copy: {e}")
         return None
-
-    today = today_local_str(tz_name)
-
-    mask = (
-        (obs["airport"] == airport) &
-        (obs["timestamp_local"].astype(str).str[:10] == today)
-    )
-    todays = obs.loc[mask, "temp"].dropna()
-
-    if todays.empty:
-        print(f"    WARNING: no observations for {airport} on {today}")
-        return None
-
-    return round(float(todays.max()), 3)
 
 
 # ---------------------------------------------------------------------------
-# S1 — Wunderground almanac scrape via Selenium
+# Selenium — one driver per thread, using pre-installed ChromeDriver
 # ---------------------------------------------------------------------------
 
 def make_driver() -> webdriver.Chrome:
@@ -187,14 +176,13 @@ def make_driver() -> webdriver.Chrome:
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
     )
-    prefs = {
+    options.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
-    }
-    options.add_experimental_option("prefs", prefs)
+    })
     options.page_load_strategy = "eager"
     return webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
+        service=Service(CHROMEDRIVER_PATH),
         options=options,
     )
 
@@ -206,54 +194,42 @@ def fetch_wunderground_almanac_high_selenium(
 ) -> float | None:
     today = today_local_str(tz_name)
     url   = f"https://www.wunderground.com/history/daily/{icao}/date/{today}"
-
     driver.get(url)
 
     try:
         WebDriverWait(driver, PAGE_TIMEOUT).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "lib-city-history-almanac")
-            )
+            EC.presence_of_element_located((By.CSS_SELECTOR, "lib-city-history-almanac"))
         )
-        time.sleep(2)
+        time.sleep(1.5)
     except Exception:
-        print(f"    WARNING: Wunderground almanac section did not load for {icao}")
+        print(f"    [{icao}] WARNING: almanac section did not load")
         return None
 
     unit = "F"
     try:
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-        if "°C" in page_text or "\u2103" in page_text:
+        if "°C" in driver.find_element(By.TAG_NAME, "body").text:
             unit = "C"
     except Exception:
         pass
 
+    # Primary parse
     try:
         almanac = driver.find_element(By.CSS_SELECTOR, "lib-city-history-almanac")
-        rows    = almanac.find_elements(By.CSS_SELECTOR, "div.row.collapse")
-
-        for row in rows:
+        for row in almanac.find_elements(By.CSS_SELECTOR, "div.row.collapse"):
             try:
-                label_divs = row.find_elements(By.CSS_SELECTOR, "div.columns")
-                if not label_divs:
+                cols = row.find_elements(By.CSS_SELECTOR, "div.columns")
+                if not cols or cols[0].text.strip().lower() != "high" or len(cols) < 2:
                     continue
-                if label_divs[0].text.strip().lower() != "high":
-                    continue
-                if len(label_divs) < 2:
-                    continue
-                span = label_divs[1].find_element(
-                    By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']"
-                )
-                val_text = span.text.strip()
-                if val_text:
-                    result = clean_temp_to_celsius(float(val_text), unit)
-                    if result is not None:
-                        return result
+                span = cols[1].find_element(By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']")
+                val  = clean_temp_to_celsius(float(span.text.strip()), unit)
+                if val is not None:
+                    return val
             except Exception:
                 continue
     except Exception as e:
-        print(f"    WARNING: Wunderground almanac parse error for {icao}: {e}")
+        print(f"    [{icao}] WARNING: almanac parse error: {e}")
 
+    # XPath fallback
     try:
         xpath = (
             "//lib-city-history-almanac"
@@ -262,21 +238,18 @@ def fetch_wunderground_almanac_high_selenium(
             "//span[contains(@class,'wu-value')]"
         )
         for span in driver.find_elements(By.XPATH, xpath):
-            try:
-                result = clean_temp_to_celsius(float(span.text.strip()), unit)
-                if result is not None:
-                    return result
-            except ValueError:
-                continue
-    except Exception as e:
-        print(f"    WARNING: Wunderground XPath fallback failed for {icao}: {e}")
+            val = clean_temp_to_celsius(float(span.text.strip()), unit)
+            if val is not None:
+                return val
+    except Exception:
+        pass
 
-    print(f"    WARNING: Wunderground — could not parse almanac high for {icao} on {today}")
+    print(f"    [{icao}] WARNING: could not parse almanac high for {today}")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Open-Meteo daily max
+# Open-Meteo
 # ---------------------------------------------------------------------------
 
 def fetch_open_meteo_daily_max(
@@ -286,8 +259,7 @@ def fetch_open_meteo_daily_max(
     tz_name: str,
     model: str,
 ) -> float | None:
-    url   = "https://api.open-meteo.com/v1/forecast"
-    today = today_local_str(tz_name)
+    today  = today_local_str(tz_name)
     params = {
         "latitude":         lat,
         "longitude":        lon,
@@ -298,22 +270,18 @@ def fetch_open_meteo_daily_max(
         "temperature_unit": "celsius",
         "models":           model,
     }
-    r     = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r    = session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    data  = r.json()
-    dates = data.get("daily", {}).get("time", [])
-    vals  = data.get("daily", {}).get("temperature_2m_max", [])
-
-    for d, v in zip(dates, vals):
+    data = r.json()
+    for d, v in zip(data.get("daily", {}).get("time", []), data.get("daily", {}).get("temperature_2m_max", [])):
         if d == today and v is not None:
             return clean_temp_to_celsius(v, "C")
-
-    print(f"    WARNING: Open-Meteo [{model}] — no match for {today}, got: {dates}")
+    print(f"    WARNING: Open-Meteo [{model}] — no match for {today}")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Purge rows from previous local days
+# Purge old rows
 # ---------------------------------------------------------------------------
 
 def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
@@ -332,62 +300,70 @@ def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Per-airport orchestration
+# Per-airport worker — each thread owns its own driver and session
 # ---------------------------------------------------------------------------
 
-def fetch_airport_forecasts(
-    driver: webdriver.Chrome,
-    api_session: requests.Session,
-    airport: str,
-    meta: dict,
-) -> dict:
+def process_airport(airport: str, meta: dict) -> dict | None:
     lat, lon, tz_name, icao = meta["lat"], meta["lon"], meta["tz"], meta["icao"]
     s3_model = S3_MODEL[airport]
 
-    pulled_at_local     = now_local_naive(tz_name)
-    forecast_date_local = today_local_str(tz_name)
+    driver      = make_driver()
+    api_session = make_api_session()
 
-    # Observed max from stable snapshot — safe from concurrent writes
-    observed_max = load_observed_max_today(airport, tz_name)
-    print(f"  Observed max today = {observed_max}")
-
-    src1 = None
     try:
-        src1 = fetch_wunderground_almanac_high_selenium(driver, icao, tz_name)
-    except Exception as e:
-        print(f"  S1 Wunderground FAILED: {e}")
+        pulled_at_local     = now_local_naive(tz_name)
+        forecast_date_local = today_local_str(tz_name)
 
-    src2_forecast = None
-    try:
-        src2_forecast = fetch_open_meteo_daily_max(
-            api_session, lat, lon, tz_name, "ecmwf_ifs025"
+        observed_max = load_observed_max_today(airport, tz_name)
+        print(f"  [{airport}] Observed max today = {observed_max}")
+
+        # S1 — Wunderground
+        src1 = None
+        try:
+            src1 = fetch_wunderground_almanac_high_selenium(driver, icao, tz_name)
+        except Exception as e:
+            print(f"  [{airport}] S1 Wunderground FAILED: {e}")
+
+        # S2 — ECMWF + observed max
+        src2_forecast = None
+        try:
+            src2_forecast = fetch_open_meteo_daily_max(api_session, lat, lon, tz_name, "ecmwf_ifs025")
+        except Exception as e:
+            print(f"  [{airport}] S2 ECMWF FAILED: {e}")
+        src2 = max_ignore_none(src2_forecast, observed_max)
+
+        # S3 — regional model + observed max
+        src3_forecast = None
+        try:
+            src3_forecast = fetch_open_meteo_daily_max(api_session, lat, lon, tz_name, s3_model)
+        except Exception as e:
+            print(f"  [{airport}] S3 {s3_model} FAILED: {e}")
+        src3 = max_ignore_none(src3_forecast, observed_max)
+
+        print(
+            f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={mean_ignore_none([src1, src2, src3])}"
         )
-    except Exception as e:
-        print(f"  S2 ECMWF FAILED: {e}")
-    src2 = max_ignore_none(src2_forecast, observed_max)
 
-    src3_forecast = None
-    try:
-        src3_forecast = fetch_open_meteo_daily_max(
-            api_session, lat, lon, tz_name, s3_model
-        )
-    except Exception as e:
-        print(f"  S3 {s3_model} FAILED: {e}")
-    src3 = max_ignore_none(src3_forecast, observed_max)
+        return {
+            "airport":             airport,
+            "icao":                icao,
+            "forecast_date_local": forecast_date_local,
+            "pulled_at_local":     pulled_at_local,
+            "forecast_source_1":   src1,
+            "forecast_source_2":   src2,
+            "forecast_source_3":   src3,
+            "forecast_avg_max":    mean_ignore_none([src1, src2, src3]),
+            "source_1_name":       "wunderground_almanac_forecast_high",
+            "source_2_name":       "max(ecmwf_ifs025,observed_today)",
+            "source_3_name":       f"max({s3_model},observed_today)",
+        }
 
-    return {
-        "airport":             airport,
-        "icao":                icao,
-        "forecast_date_local": forecast_date_local,
-        "pulled_at_local":     pulled_at_local,
-        "forecast_source_1":   src1,
-        "forecast_source_2":   src2,
-        "forecast_source_3":   src3,
-        "forecast_avg_max":    mean_ignore_none([src1, src2, src3]),
-        "source_1_name":       "wunderground_almanac_forecast_high",
-        "source_2_name":       "max(ecmwf_ifs025,observed_today)",
-        "source_3_name":       f"max({s3_model},observed_today)",
-    }
+    except Exception as e:
+        print(f"  [{airport}] FAILED: {e}")
+        return None
+
+    finally:
+        driver.quit()
 
 
 # ---------------------------------------------------------------------------
@@ -408,40 +384,32 @@ def load_existing(path: str) -> pd.DataFrame:
     return pd.DataFrame(columns=cols)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
-    # Snapshot observations.parquet before anything else — all reads this
-    # run use the stable copy, immune to concurrent workflow writes.
     snapshot_observations()
 
-    api_session = make_api_session()
-    driver      = make_driver()
     rows: list[dict] = []
 
-    try:
-        for airport, meta in AIRPORTS.items():
-            s3_model = S3_MODEL[airport]
-            print(
-                f"\nFetching {airport} ({meta['icao']}) "
-                f"[S1=wunderground | S2=ecmwf+obs | S3={s3_model}+obs] "
-                f"local date: {today_local_str(meta['tz'])}"
-            )
+    # Run all airports in parallel — each gets its own driver + session
+    # Max 13 workers (one per airport); GitHub Actions runners have enough RAM
+    with ThreadPoolExecutor(max_workers=len(AIRPORTS)) as executor:
+        futures = {
+            executor.submit(process_airport, airport, meta): airport
+            for airport, meta in AIRPORTS.items()
+        }
+        for future in as_completed(futures):
+            airport = futures[future]
             try:
-                row = fetch_airport_forecasts(driver, api_session, airport, meta)
-                rows.append(row)
-                print(
-                    f"  S1 Wunderground      = {row['forecast_source_1']}\n"
-                    f"  S2 ECMWF+obs         = {row['forecast_source_2']}\n"
-                    f"  S3 {s3_model}+obs = {row['forecast_source_3']}\n"
-                    f"  AVG                  = {row['forecast_avg_max']}"
-                )
+                result = future.result()
+                if result is not None:
+                    rows.append(result)
             except Exception as e:
-                print(f"  FAILED: {e}")
+                print(f"  [{airport}] Unhandled exception: {e}")
 
-            time.sleep(SLEEP_SECONDS)
-
-    finally:
-        driver.quit()
-        cleanup_observations_copy()  # always delete the snapshot
+    cleanup_observations_copy()
 
     if not rows:
         print("No rows fetched; nothing saved.")
