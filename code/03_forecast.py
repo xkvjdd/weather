@@ -1,3 +1,5 @@
+# Requirements: requests, pandas, pyarrow, beautifulsoup4
+
 import os
 import re
 import time
@@ -24,16 +26,15 @@ AIRPORTS = {
     "WLG": {"icao": "NZWN", "lat": -41.3272,"lon": 174.8050, "tz": "Pacific/Auckland"},
 }
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
-DATA_DIR   = os.path.join(REPO_ROOT, "data", "dashboard")
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT   = os.path.dirname(SCRIPT_DIR)
+DATA_DIR    = os.path.join(REPO_ROOT, "data", "dashboard")
 os.makedirs(DATA_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
 
 HTTP_TIMEOUT  = 30
 SLEEP_SECONDS = 0.5
 
-# Wunderground needs a browser-like UA; aviationweather.gov wants a descriptive one
 HEADERS_BROWSER = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -87,12 +88,9 @@ def mean_ignore_none(values: list[float | None]) -> float | None:
 # ---------------------------------------------------------------------------
 # S1 — aviationweather.gov TAF
 # Free, no key, global ICAO coverage.
-# TAFs contain TX (max temp) and TN (min temp) fields in the forecast periods
-# for many international stations. We parse all forecast periods that fall
-# within today (local) and return the max temperature seen.
-# Note: not all TAFs include TX/TN (US domestic TAFs often omit them), so
-# this may return None for some airports — that's expected and the avg
-# gracefully handles it.
+# Parses TX (max temp) fields from forecast periods within today local.
+# Note: US domestic TAFs often omit TX/TN so may return None for some
+# US airports — avg handles this gracefully.
 # ---------------------------------------------------------------------------
 
 def fetch_taf_max_today(
@@ -100,9 +98,9 @@ def fetch_taf_max_today(
     icao: str,
     tz_name: str,
 ) -> float | None:
-    url = f"https://aviationweather.gov/api/data/taf"
+    url    = "https://aviationweather.gov/api/data/taf"
     params = {"ids": icao, "format": "json", "metar": "false"}
-    r = api_session.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r      = api_session.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
     data = r.json()
@@ -110,19 +108,15 @@ def fetch_taf_max_today(
         print(f"    WARNING: TAF — empty response for {icao}")
         return None
 
-    taf = data[0] if isinstance(data, list) else data
+    taf   = data[0] if isinstance(data, list) else data
     today = today_local_str(tz_name)
     tz    = ZoneInfo(tz_name)
-
     temps: list[float] = []
 
-    # TAF forecast periods — look for temperature fields
     for period in taf.get("fcsts", []):
-        # Check period start falls within today local
         valid_time = period.get("timeFrom") or period.get("validTimeFrom")
         if valid_time:
             try:
-                # aviationweather returns epoch seconds or ISO string
                 if isinstance(valid_time, (int, float)):
                     dt_local = datetime.fromtimestamp(valid_time, tz=timezone.utc).astimezone(tz)
                 else:
@@ -130,9 +124,8 @@ def fetch_taf_max_today(
                 if dt_local.date().isoformat() != today:
                     continue
             except Exception:
-                pass  # if we can't parse time, still check for temp
+                pass
 
-        # TX field (forecast max temp, Celsius)
         for key in ("maxTemp", "tx", "tempMax", "temperature"):
             val = period.get(key)
             if val is not None:
@@ -149,12 +142,9 @@ def fetch_taf_max_today(
 
 # ---------------------------------------------------------------------------
 # S2 — Wunderground almanac scrape
-# Targets: https://www.wunderground.com/history/daily/{ICAO}/date/{YYYY-MM-DD}
-# The almanac table for today's date contains a "Forecast" column with the
-# high temp. The value lives in:
-#   span.wu-value.wu-value-to   (inside the High row of the temperature table)
-# Unit is shown separately — page defaults to °F for US, °C for international,
-# but we detect from the label and always convert to Celsius.
+# URL: wunderground.com/history/daily/{ICAO}/date/{YYYY-MM-DD}
+# Today's date is hardcoded in the URL so can never bleed into tomorrow.
+# Target: span.wu-value.wu-value-to inside the almanac High row.
 # ---------------------------------------------------------------------------
 
 def fetch_wunderground_almanac_high(
@@ -170,60 +160,38 @@ def fetch_wunderground_almanac_high(
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Find all wu-value spans — the almanac forecast high is the first
-    # wu-value.wu-value-to inside the temperature section "High" row.
-    # We locate the "High" label row then grab the first wu-value-to within it.
-
-    # Strategy: find all rows, look for one whose text contains "High"
-    forecast_high: float | None = None
-    unit = "F"  # Wunderground defaults; we'll detect below
-
-    # Detect unit from page — look for °C indicator anywhere in almanac table
-    page_text = soup.get_text()
-    if "°C" in page_text or "&#8451;" in r.text:
+    # Detect unit from page text
+    unit = "F"
+    if "°C" in soup.get_text() or "&#8451;" in r.text:
         unit = "C"
 
-    # Find the almanac section specifically (avoid picking up current conditions)
-    # The almanac table has class "history-table" or similar; look for the
-    # forecast High value via the wu-value-to span pattern
-    tables = soup.find_all("lib-city-history-almanac") or soup.find_all(
-        "div", class_=re.compile(r"history|almanac", re.I)
-    )
-
-    # Fallback: just grab ALL wu-value-to spans and take the first numeric one
-    # that appears after a "High" label in the DOM order
-    all_spans = soup.find_all("span", class_=re.compile(r"wu-value-to"))
-
-    # Walk the DOM looking for a "High" text node followed by a wu-value-to span
+    # Find first wu-value-to span that appears after a "High" label in the DOM
     body_text = str(soup)
-    # Pattern: "High" ... wu-value-to">NUMBER<
     m = re.search(
         r"High\b.{0,400}?wu-value[^>]*wu-value-to[^>]*>(\-?\d+(?:\.\d+)?)<",
         body_text,
         re.DOTALL | re.IGNORECASE,
     )
     if m:
-        forecast_high = clean_temp_to_celsius(m.group(1), unit)
+        result = clean_temp_to_celsius(m.group(1), unit)
+        if result is not None:
+            return result
 
-    if forecast_high is None and all_spans:
-        for span in all_spans:
-            try:
-                v = float(span.get_text(strip=True))
-                forecast_high = clean_temp_to_celsius(v, unit)
-                break
-            except ValueError:
-                continue
+    # Fallback: first parseable wu-value-to span
+    for span in soup.find_all("span", class_=re.compile(r"wu-value-to")):
+        try:
+            return clean_temp_to_celsius(float(span.get_text(strip=True)), unit)
+        except ValueError:
+            continue
 
-    if forecast_high is None:
-        print(f"    WARNING: Wunderground almanac — could not parse high for {icao} on {today}")
-
-    return forecast_high
+    print(f"    WARNING: Wunderground almanac — could not parse high for {icao} on {today}")
+    return None
 
 
 # ---------------------------------------------------------------------------
 # S3 — Open-Meteo GFS seamless daily max
-# Grid-interpolated but fully automated, reliable, no key needed.
-# start_date=end_date=today (local) prevents any cross-day bleed.
+# Grid-interpolated backup. start_date=end_date=today (local) prevents
+# any cross-day bleed regardless of time of day.
 # ---------------------------------------------------------------------------
 
 def fetch_open_meteo_gfs_daily_max(
@@ -244,7 +212,7 @@ def fetch_open_meteo_gfs_daily_max(
         "temperature_unit": "celsius",
         "models":           "gfs_seamless",
     }
-    r = api_session.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r     = api_session.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data  = r.json()
     dates = data.get("daily", {}).get("time", [])
@@ -256,6 +224,27 @@ def fetch_open_meteo_gfs_daily_max(
 
     print(f"    WARNING: Open-Meteo GFS — no match for {today}, got: {dates}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Purge rows from previous local days
+# For each airport, drop any row whose forecast_date_local != today in
+# that airport's own timezone. Keeps the parquet lean — today only.
+# ---------------------------------------------------------------------------
+
+def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    keep_mask = df.apply(
+        lambda row: row["forecast_date_local"] == today_local_str(
+            AIRPORTS.get(row["airport"], {}).get("tz", "UTC")
+        ),
+        axis=1,
+    )
+    dropped = int((~keep_mask).sum())
+    if dropped:
+        print(f"  Purged {dropped} row(s) from previous local days")
+    return df[keep_mask].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -275,36 +264,33 @@ def fetch_airport_forecasts(
 
     src1 = src2 = src3 = None
 
-    # S1 — TAF via aviationweather.gov
     try:
         src1 = fetch_taf_max_today(api_session, icao, tz_name)
     except Exception as e:
         print(f"  S1 TAF FAILED: {e}")
 
-    # S2 — Wunderground almanac scrape
     try:
         src2 = fetch_wunderground_almanac_high(browser_session, icao, tz_name)
     except Exception as e:
         print(f"  S2 Wunderground FAILED: {e}")
 
-    # S3 — Open-Meteo GFS
     try:
         src3 = fetch_open_meteo_gfs_daily_max(api_session, lat, lon, tz_name)
     except Exception as e:
         print(f"  S3 GFS FAILED: {e}")
 
     return {
-        "airport":              airport,
-        "icao":                 icao,
-        "forecast_date_local":  forecast_date_local,
-        "pulled_at_local":      pulled_at_local,
-        "forecast_source_1":    src1,
-        "forecast_source_2":    src2,
-        "forecast_source_3":    src3,
-        "forecast_avg_max":     mean_ignore_none([src1, src2, src3]),
-        "source_1_name":        "aviationweather_taf_max",
-        "source_2_name":        "wunderground_almanac_forecast_high",
-        "source_3_name":        "open_meteo_gfs_seamless_daily_max",
+        "airport":             airport,
+        "icao":                icao,
+        "forecast_date_local": forecast_date_local,
+        "pulled_at_local":     pulled_at_local,
+        "forecast_source_1":   src1,
+        "forecast_source_2":   src2,
+        "forecast_source_3":   src3,
+        "forecast_avg_max":    mean_ignore_none([src1, src2, src3]),
+        "source_1_name":       "aviationweather_taf_max",
+        "source_2_name":       "wunderground_almanac_forecast_high",
+        "source_3_name":       "open_meteo_gfs_seamless_daily_max",
     }
 
 
@@ -340,10 +326,10 @@ def main() -> None:
             row = fetch_airport_forecasts(api_session, browser_session, airport, meta)
             rows.append(row)
             print(
-                f"  S1 TAF       = {row['forecast_source_1']}\n"
-                f"  S2 Wunder    = {row['forecast_source_2']}\n"
-                f"  S3 GFS       = {row['forecast_source_3']}\n"
-                f"  AVG          = {row['forecast_avg_max']}"
+                f"  S1 TAF    = {row['forecast_source_1']}\n"
+                f"  S2 Wunder = {row['forecast_source_2']}\n"
+                f"  S3 GFS    = {row['forecast_source_3']}\n"
+                f"  AVG       = {row['forecast_avg_max']}"
             )
         except Exception as e:
             print(f"  FAILED: {e}")
@@ -356,6 +342,7 @@ def main() -> None:
 
     new_df   = pd.DataFrame(rows)
     existing = load_existing(OUTPUT_PATH)
+    existing = purge_old_forecasts(existing)        # drop any prior-day rows
     combined = pd.concat([existing, new_df], ignore_index=True)
 
     combined["pulled_at_local"] = pd.to_datetime(combined["pulled_at_local"], errors="coerce")
