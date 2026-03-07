@@ -1,9 +1,11 @@
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -15,6 +17,9 @@ from selenium.webdriver.support import expected_conditions as EC
 MAX_WORKERS_HTTP = 24
 MAX_WORKERS_SELENIUM = 3
 TIMEOUT = 12
+
+DATA_DIR = "data/dashboard"
+FORECAST_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
 
 HEADERS = {
     "User-Agent": (
@@ -43,7 +48,7 @@ AIRPORT_META = {
 
 # S1 = AccuWeather
 # S2 = BBC
-# S3 = Weather.com (uses lat/lon coords for reliable URL)
+# S3 = Weather.com
 AIRPORT_LINKS = {
     "ATL": {
         "S1": "https://www.accuweather.com/en/us/hartsfield-jackson-atlanta-international-airport/30320/weather-forecast/9416_poi",
@@ -117,8 +122,12 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def now_local(code: str) -> datetime:
+def now_local_dt(code: str) -> datetime:
     return datetime.now(ZoneInfo(AIRPORT_META[code]["tz"]))
+
+
+def now_local_str(code: str) -> str:
+    return now_local_dt(code).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def c_to_f(c: float) -> float:
@@ -136,20 +145,25 @@ def first_int(text: str):
     return int(m.group()) if m else None
 
 
+def mean_ignore_none(values):
+    vals = [float(v) for v in values if v is not None and pd.notna(v)]
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 3)
+
+
 def infer_accuweather_unit(code: str, final_url: str, text: str = "") -> str:
     code = (code or "").upper()
     final_url = (final_url or "").lower()
     text = (text or "").lower()
 
-    # Based on actual results observed from these airport pages
+    # Based on observed output from these airport pages
     if code in {"ATL", "NYC", "CHI", "DAL", "SEA", "MIA", "BUE", "LON", "WLG"}:
         return "F"
 
-    # US pages default to Fahrenheit
     if "/en/us/" in final_url:
         return "F"
 
-    # Explicit signal if page text ever contains Fahrenheit wording
     if "fahrenheit" in text or "°f" in text:
         return "F"
 
@@ -246,7 +260,6 @@ def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
             "match_text": match_text[:300],
         }
 
-    # 1) Best path: 10-day list row high temp span
     for idx, row in enumerate(soup.select("a.daily-list-item")):
         hi = row.select_one("span.temp-hi")
         if hi:
@@ -255,7 +268,6 @@ def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
                 row_text = clean_text(row.get_text(" ", strip=True))
                 return build_result(temp_raw, f"accuweather_daily_list_temp_hi_{idx}", row_text)
 
-    # 2) Today's weather card text like "Hi: 28°"
     for idx, card in enumerate(soup.select("div.today-forecast-card")):
         txt = clean_text(card.get_text(" ", strip=True))
         m = re.search(r"\bHi\s*:\s*(-?\d+)", txt, flags=re.I)
@@ -263,7 +275,6 @@ def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
             temp_raw = int(m.group(1))
             return build_result(temp_raw, f"accuweather_today_card_{idx}", txt)
 
-    # 3) Generic span fallback
     hi = soup.select_one("span.temp-hi")
     if hi:
         temp_raw = first_int(hi.get_text(" ", strip=True))
@@ -271,7 +282,6 @@ def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
             txt = clean_text(hi.get_text(" ", strip=True))
             return build_result(temp_raw, "accuweather_span_temp_hi", txt)
 
-    # 4) Raw HTML fallback
     raw_patterns = [
         r'<span[^>]*class="[^"]*temp-hi[^"]*"[^>]*>\s*(-?\d+)\s*°?\s*</span>',
         r"\bHi\s*:\s*(-?\d+)\s*°",
@@ -291,7 +301,7 @@ def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
 
 def parse_bbc_today_high(code: str, html: str):
     text = clean_text(html)
-    dt = now_local(code)
+    dt = now_local_dt(code)
     weekday_full = dt.strftime("%A")
     day_num = str(dt.day)
 
@@ -307,7 +317,7 @@ def parse_bbc_today_high(code: str, html: str):
         if m:
             c = int(m.group(1))
             return {
-                "temp_c": c,
+                "temp_c": float(c),
                 "temp_f": c_to_f(c),
                 "method": f"bbc_p{i}",
                 "match_text": m.group(0)[:300],
@@ -318,14 +328,11 @@ def parse_bbc_today_high(code: str, html: str):
 
 # ============================================================
 # S3 WEATHER.COM
-# NOTE: temperatures returned are in °F (weather.com US default).
-#       We store the raw value in temp_f and convert to temp_c.
 # ============================================================
 
 def parse_weathercom_today_high(code: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) Expanded today block
     for idx, block in enumerate(soup.select('div[data-testid="DailyContent"]')):
         temp_span = block.select_one('span[data-testid="TemperatureValue"]')
         if temp_span:
@@ -333,13 +340,12 @@ def parse_weathercom_today_high(code: str, html: str):
             if temp_val is not None:
                 block_text = clean_text(block.get_text(" ", strip=True))
                 return {
-                    "temp_f": temp_val,
+                    "temp_f": float(temp_val),
                     "temp_c": f_to_c(temp_val),
                     "method": f"weathercom_dailycontent_{idx}",
                     "match_text": block_text[:300],
                 }
 
-    # 2) Summary fallback
     for idx, summ in enumerate(soup.select('summary[data-testid="Disclosure-Summary"]')):
         temp_span = summ.select_one('span[data-testid="TemperatureValue"]')
         if temp_span:
@@ -347,13 +353,12 @@ def parse_weathercom_today_high(code: str, html: str):
             if temp_val is not None:
                 summ_text = clean_text(summ.get_text(" ", strip=True))
                 return {
-                    "temp_f": temp_val,
+                    "temp_f": float(temp_val),
                     "temp_c": f_to_c(temp_val),
                     "method": f"weathercom_summary_{idx}",
                     "match_text": summ_text[:300],
                 }
 
-    # 3) Raw HTML fallback
     raw_patterns = [
         r'data-testid="DailyContent".{0,600}?data-testid="TemperatureValue"[^>]*>\s*(-?\d+)',
         r'data-testid="TemperatureValue"[^>]*>\s*(-?\d+)\s*<',
@@ -364,7 +369,7 @@ def parse_weathercom_today_high(code: str, html: str):
         if m:
             f = int(m.group(1))
             return {
-                "temp_f": f,
+                "temp_f": float(f),
                 "temp_c": f_to_c(f),
                 "method": f"weathercom_regex_{i}",
                 "match_text": m.group(0)[:300],
@@ -387,7 +392,7 @@ def empty_row(code: str):
     return {
         "code": code,
         "airport": AIRPORT_META[code]["name"],
-        "local_now": now_local(code).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "local_now": now_local_str(code),
         "S1_url": AIRPORT_LINKS[code]["S1"],
         "S2_url": AIRPORT_LINKS[code]["S2"],
         "S3_url": AIRPORT_LINKS[code]["S3"],
@@ -555,6 +560,45 @@ def process_all():
     return list(results.values())
 
 
+def build_forecast_dataframe(rows):
+    records = []
+
+    for r in rows:
+        s1 = r.get("S1_temp_c")
+        s2 = r.get("S2_temp_c")
+        s3 = r.get("S3_temp_c")
+        avg = mean_ignore_none([s1, s2, s3])
+
+        pulled_local = now_local_dt(r["code"]).strftime("%Y-%m-%d %H:%M:%S")
+
+        records.append(
+            {
+                "airport": r["code"],
+                "forecast_avg_max": avg,
+                "forecast_source_1": s1,
+                "forecast_source_2": s2,
+                "forecast_source_3": s3,
+                "pulled_at_local": pulled_local,
+                "forecast_source_1_method": r.get("S1_method"),
+                "forecast_source_2_method": r.get("S2_method"),
+                "forecast_source_3_method": r.get("S3_method"),
+                "forecast_source_1_error": r.get("S1_error"),
+                "forecast_source_2_error": r.get("S2_error"),
+                "forecast_source_3_error": r.get("S3_error"),
+            }
+        )
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.sort_values("airport").reset_index(drop=True)
+    return df
+
+
+def save_forecast_parquet(df: pd.DataFrame, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_parquet(path, index=False)
+
+
 def main():
     rows = process_all()
 
@@ -579,6 +623,13 @@ def main():
 
     print("\nFINAL_JSON =")
     print(json.dumps(rows, indent=2, ensure_ascii=False))
+
+    df = build_forecast_dataframe(rows)
+    save_forecast_parquet(df, FORECAST_PATH)
+
+    print("\nFORECAST_DF =")
+    print(df.to_string(index=False))
+    print(f"\nSaved forecast parquet -> {FORECAST_PATH}")
 
 
 if __name__ == "__main__":
