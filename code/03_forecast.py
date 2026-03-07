@@ -1,6 +1,8 @@
 # Requirements: requests, pandas, pyarrow, selenium, webdriver-manager, beautifulsoup4
 
+import math
 import os
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +20,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
+
 AIRPORTS = {
     "ATL": {"icao": "KATL", "lat": 33.6407, "lon": -84.4277, "tz": "America/New_York"},
     "NYC": {"icao": "KLGA", "lat": 40.7769, "lon": -73.8740, "tz": "America/New_York"},
@@ -29,25 +32,27 @@ AIRPORTS = {
     "PAR": {"icao": "LFPG", "lat": 49.0097, "lon": 2.5479,   "tz": "Europe/Paris"},
     "SEL": {"icao": "RKSI", "lat": 37.4602, "lon": 126.4407, "tz": "Asia/Seoul"},
     "ANK": {"icao": "LTAC", "lat": 40.1281, "lon": 32.9951,  "tz": "Europe/Istanbul"},
-    "BUE": {"icao": "SAEZ", "lat": -34.8222,"lon": -58.5358, "tz": "America/Argentina/Buenos_Aires"},
+    "BUE": {"icao": "SAEZ", "lat": -34.8222, "lon": -58.5358, "tz": "America/Argentina/Buenos_Aires"},
     "LON": {"icao": "EGLL", "lat": 51.4700, "lon": -0.4543,  "tz": "Europe/London"},
-    "WLG": {"icao": "NZWN", "lat": -41.3272,"lon": 174.8050, "tz": "Pacific/Auckland"},
+    "WLG": {"icao": "NZWN", "lat": -41.3272, "lon": 174.8050, "tz": "Pacific/Auckland"},
 }
 
-S3_MODEL = {
-    "ATL": "gem_seamless",
-    "NYC": "gem_seamless",
-    "CHI": "gem_seamless",
-    "DAL": "gem_seamless",
-    "SEA": "gem_seamless",
-    "MIA": "gem_seamless",
-    "TOR": "gem_seamless",
-    "LON": "icon_seamless",
-    "PAR": "icon_seamless",
-    "ANK": "icon_seamless",
-    "SEL": "jma_seamless",
-    "BUE": "bom_access_global",
-    "WLG": "bom_access_global",
+# Meteofor location paths
+# Format: country-slug / city-slug / airport-page-slug
+METEOFOR_PATHS = {
+    "ATL": "united-states/atlanta/airport-hartsfield-jackson",
+    "NYC": "united-states/new-york/airport-la-guardia",
+    "CHI": "united-states/chicago/airport-ohare",
+    "DAL": "united-states/dallas/airport-love-field",
+    "SEA": "united-states/seattle/airport-seattle-tacoma",
+    "MIA": "united-states/miami/airport-miami",
+    "TOR": "canada/toronto/airport-lester-b-pearson",
+    "PAR": "france/paris/airport-charles-de-gaulle",
+    "SEL": "south-korea/seoul/airport-incheon",
+    "ANK": "turkey/ankara/airport-esenboga",
+    "BUE": "argentina/buenos-aires/airport-ezeiza",
+    "LON": "united-kingdom/london/airport-heathrow",
+    "WLG": "new-zealand/wellington/airport-wellington",
 }
 
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -102,7 +107,7 @@ def clean_temp_to_celsius(value, unit: str | None = None) -> float | None:
 
 
 def mean_ignore_none(values: list[float | None]) -> float | None:
-    xs = [float(v) for v in values if v is not None]
+    xs = [float(v) for v in values if v is not None and not pd.isna(v)]
     if not xs:
         return None
     result = round(sum(xs) / len(xs), 3)
@@ -111,9 +116,16 @@ def mean_ignore_none(values: list[float | None]) -> float | None:
     return result
 
 
-def max_ignore_none(a: float | None, b: float | None) -> float | None:
-    vals = [v for v in [a, b] if v is not None]
-    return round(max(vals), 3) if vals else None
+def extract_number(text: str) -> float | None:
+    if text is None:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(text).replace(",", ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +150,9 @@ def load_observed_max_today(airport: str, tz_name: str) -> float | None:
     if not os.path.exists(OBSERVATIONS_COPY):
         return None
     try:
-        obs   = pd.read_parquet(OBSERVATIONS_COPY)
+        obs = pd.read_parquet(OBSERVATIONS_COPY)
         today = today_local_str(tz_name)
-        mask  = (
+        mask = (
             (obs["airport"] == airport) &
             (obs["timestamp_local"].astype(str).str[:10] == today)
         )
@@ -170,7 +182,7 @@ def make_driver() -> webdriver.Chrome:
     options.add_argument("--disable-default-apps")
     options.add_argument("--no-first-run")
     options.add_argument("--mute-audio")
-    options.add_argument("--window-size=1400,1200")
+    options.add_argument("--window-size=1800,1400")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -187,96 +199,198 @@ def make_driver() -> webdriver.Chrome:
     )
 
 
-def fetch_wunderground_almanac_high_selenium(
+def dismiss_common_popups(driver: webdriver.Chrome) -> None:
+    selectors = [
+        "button[aria-label='Close']",
+        "button[aria-label='close']",
+        "button[title='Close']",
+        "button[title='close']",
+        ".close",
+        ".modal__close",
+        ".popup-close",
+        ".fc-close",
+        ".fc-button.fc-cta-consent.fc-primary-button",
+    ]
+    for sel in selectors:
+        try:
+            elems = driver.find_elements(By.CSS_SELECTOR, sel)
+            for elem in elems[:3]:
+                try:
+                    driver.execute_script("arguments[0].click();", elem)
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# S1 — Wunderground forecast almanac high
+# ---------------------------------------------------------------------------
+
+def fetch_wunderground_forecast_high_selenium(
     driver: webdriver.Chrome,
     icao: str,
     tz_name: str,
 ) -> float | None:
     today = today_local_str(tz_name)
-    url   = f"https://www.wunderground.com/history/daily/{icao}/date/{today}"
+    url = f"https://www.wunderground.com/history/daily/{icao}/date/{today}"
     driver.get(url)
 
     try:
         WebDriverWait(driver, PAGE_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "lib-city-history-almanac"))
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-        time.sleep(1.5)
+        time.sleep(2.0)
+        dismiss_common_popups(driver)
     except Exception:
-        print(f"    [{icao}] WARNING: almanac section did not load")
+        print(f"    [{icao}] WARNING: body did not load")
         return None
 
     unit = "F"
     try:
-        if "°C" in driver.find_element(By.TAG_NAME, "body").text:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        if "°C" in body_text:
             unit = "C"
     except Exception:
         pass
 
-    # Primary parse
+    # Strategy 1: direct parse from the almanac table rows
     try:
-        almanac = driver.find_element(By.CSS_SELECTOR, "lib-city-history-almanac")
-        for row in almanac.find_elements(By.CSS_SELECTOR, "div.row.collapse"):
+        rows = driver.find_elements(By.CSS_SELECTOR, "div.row.collapse")
+        for row in rows:
             try:
-                cols = row.find_elements(By.CSS_SELECTOR, "div.columns")
-                if not cols or cols[0].text.strip().lower() != "high" or len(cols) < 2:
+                text = row.text.strip().lower()
+                if "high" not in text:
                     continue
-                span = cols[1].find_element(By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']")
-                val  = clean_temp_to_celsius(float(span.text.strip()), unit)
+
+                cols = row.find_elements(By.CSS_SELECTOR, "div.columns")
+                if len(cols) < 3:
+                    continue
+
+                label = cols[0].text.strip().lower()
+                if label != "high":
+                    continue
+
+                # Forecast column is usually second numeric column in image 1
+                forecast_col = cols[1]
+                span = forecast_col.find_element(By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']")
+                val = clean_temp_to_celsius(extract_number(span.text), unit)
                 if val is not None:
                     return val
             except Exception:
                 continue
     except Exception as e:
-        print(f"    [{icao}] WARNING: almanac parse error: {e}")
+        print(f"    [{icao}] WARNING: WU row parse error: {e}")
 
-    # XPath fallback
+    # Strategy 2: find the exact "High" row and grab first wu-value after it
     try:
         xpath = (
-            "//lib-city-history-almanac"
             "//div[contains(@class,'row') and contains(@class,'collapse')]"
-            "[.//div[normalize-space(text())='High']]"
+            "[.//div[normalize-space()='High']]"
             "//span[contains(@class,'wu-value')]"
         )
-        for span in driver.find_elements(By.XPATH, xpath):
-            val = clean_temp_to_celsius(float(span.text.strip()), unit)
+        spans = driver.find_elements(By.XPATH, xpath)
+        if spans:
+            val = clean_temp_to_celsius(extract_number(spans[0].text), unit)
             if val is not None:
                 return val
     except Exception:
         pass
 
-    print(f"    [{icao}] WARNING: could not parse almanac high for {today}")
+    # Strategy 3: page-source regex fallback
+    try:
+        html = driver.page_source
+        # Look for High row followed by wu-value-to text content
+        patterns = [
+            r'High.*?wu-value[^>]*>(-?\d+(?:\.\d+)?)</span>',
+            r'High.*?wu-value-to[^>]*>(-?\d+(?:\.\d+)?)</span>',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                val = clean_temp_to_celsius(m.group(1), unit)
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+
+    print(f"    [{icao}] WARNING: could not parse Wunderground forecast high for {today}")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Open-Meteo
+# S2 — Meteofor today's max
 # ---------------------------------------------------------------------------
 
-def fetch_open_meteo_daily_max(
-    session: requests.Session,
-    lat: float,
-    lon: float,
+def fetch_meteofor_today_max_selenium(
+    driver: webdriver.Chrome,
+    airport: str,
     tz_name: str,
-    model: str,
 ) -> float | None:
-    today  = today_local_str(tz_name)
-    params = {
-        "latitude":         lat,
-        "longitude":        lon,
-        "daily":            "temperature_2m_max",
-        "start_date":       today,
-        "end_date":         today,
-        "timezone":         tz_name,
-        "temperature_unit": "celsius",
-        "models":           model,
-    }
-    r    = session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    for d, v in zip(data.get("daily", {}).get("time", []), data.get("daily", {}).get("temperature_2m_max", [])):
-        if d == today and v is not None:
-            return clean_temp_to_celsius(v, "C")
-    print(f"    WARNING: Open-Meteo [{model}] — no match for {today}")
+    path = METEOFOR_PATHS.get(airport)
+    if not path:
+        print(f"    [{airport}] WARNING: no Meteofor path configured")
+        return None
+
+    url = f"https://meteofor.com/{path}/"
+    driver.get(url)
+
+    try:
+        WebDriverWait(driver, PAGE_TIMEOUT).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        time.sleep(2.0)
+        dismiss_common_popups(driver)
+    except Exception:
+        print(f"    [{airport}] WARNING: Meteofor body did not load")
+        return None
+
+    # Strategy 1: active weather tab contains <temperature-value value="21" ...>
+    try:
+        active_tab = driver.find_element(By.CSS_SELECTOR, ".weathertab.is-active, .weathertabs .is-active")
+        temps = active_tab.find_elements(By.CSS_SELECTOR, "temperature-value[value]")
+        vals = []
+        for t in temps:
+            raw = t.get_attribute("value")
+            num = clean_temp_to_celsius(extract_number(raw), "C")
+            if num is not None:
+                vals.append(num)
+        if vals:
+            return round(max(vals), 3)
+    except Exception:
+        pass
+
+    # Strategy 2: any visible today panel values
+    try:
+        elems = driver.find_elements(By.CSS_SELECTOR, "temperature-value[value]")
+        vals = []
+        for elem in elems:
+            try:
+                raw = elem.get_attribute("value")
+                num = clean_temp_to_celsius(extract_number(raw), "C")
+                if num is not None and -80 <= num <= 70:
+                    vals.append(num)
+            except Exception:
+                continue
+        if vals:
+            # The page has hourly points + top tiles; max of visible values for today tab
+            return round(max(vals), 3)
+    except Exception:
+        pass
+
+    # Strategy 3: parse page source for temperature-value entries
+    try:
+        html = driver.page_source
+        matches = re.findall(r'<temperature-value[^>]*value="(-?\d+(?:\.\d+)?)"', html, flags=re.IGNORECASE)
+        vals = [clean_temp_to_celsius(x, "C") for x in matches]
+        vals = [v for v in vals if v is not None and -80 <= v <= 70]
+        if vals:
+            return round(max(vals), 3)
+    except Exception:
+        pass
+
+    print(f"    [{airport}] WARNING: could not parse Meteofor today max")
     return None
 
 
@@ -304,44 +418,40 @@ def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def process_airport(airport: str, meta: dict) -> dict | None:
-    lat, lon, tz_name, icao = meta["lat"], meta["lon"], meta["tz"], meta["icao"]
-    s3_model = S3_MODEL[airport]
+    tz_name = meta["tz"]
+    icao = meta["icao"]
 
-    driver      = make_driver()
-    api_session = make_api_session()
+    driver = make_driver()
+    _ = make_api_session()  # kept in case you want requests-based sources later
 
     try:
-        pulled_at_local     = now_local_naive(tz_name)
+        pulled_at_local = now_local_naive(tz_name)
         forecast_date_local = today_local_str(tz_name)
 
         observed_max = load_observed_max_today(airport, tz_name)
         print(f"  [{airport}] Observed max today = {observed_max}")
 
-        # S1 — Wunderground
+        # S1 — Wunderground forecast almanac high
         src1 = None
         try:
-            src1 = fetch_wunderground_almanac_high_selenium(driver, icao, tz_name)
+            src1 = fetch_wunderground_forecast_high_selenium(driver, icao, tz_name)
         except Exception as e:
             print(f"  [{airport}] S1 Wunderground FAILED: {e}")
 
-        # S2 — ECMWF + observed max
-        src2_forecast = None
+        # S2 — Meteofor today max
+        src2 = None
         try:
-            src2_forecast = fetch_open_meteo_daily_max(api_session, lat, lon, tz_name, "ecmwf_ifs025")
+            src2 = fetch_meteofor_today_max_selenium(driver, airport, tz_name)
         except Exception as e:
-            print(f"  [{airport}] S2 ECMWF FAILED: {e}")
-        src2 = max_ignore_none(src2_forecast, observed_max)
+            print(f"  [{airport}] S2 Meteofor FAILED: {e}")
 
-        # S3 — regional model + observed max
-        src3_forecast = None
-        try:
-            src3_forecast = fetch_open_meteo_daily_max(api_session, lat, lon, tz_name, s3_model)
-        except Exception as e:
-            print(f"  [{airport}] S3 {s3_model} FAILED: {e}")
-        src3 = max_ignore_none(src3_forecast, observed_max)
+        # S3 — intentionally blank for now
+        src3 = math.nan
+
+        avg_val = mean_ignore_none([src1, src2, src3])
 
         print(
-            f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={mean_ignore_none([src1, src2, src3])}"
+            f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={avg_val}"
         )
 
         return {
@@ -352,10 +462,11 @@ def process_airport(airport: str, meta: dict) -> dict | None:
             "forecast_source_1":   src1,
             "forecast_source_2":   src2,
             "forecast_source_3":   src3,
-            "forecast_avg_max":    mean_ignore_none([src1, src2, src3]),
-            "source_1_name":       "wunderground_almanac_forecast_high",
-            "source_2_name":       "max(ecmwf_ifs025,observed_today)",
-            "source_3_name":       f"max({s3_model},observed_today)",
+            "forecast_avg_max":    avg_val,
+            "observed_max_today":  observed_max,
+            "source_1_name":       "wunderground_forecast_high",
+            "source_2_name":       "meteofor_today_max",
+            "source_3_name":       "nan",
         }
 
     except Exception as e:
@@ -374,10 +485,11 @@ def load_existing(path: str) -> pd.DataFrame:
     cols = [
         "airport", "icao", "forecast_date_local", "pulled_at_local",
         "forecast_source_1", "forecast_source_2", "forecast_source_3",
-        "forecast_avg_max", "source_1_name", "source_2_name", "source_3_name",
+        "forecast_avg_max", "observed_max_today",
+        "source_1_name", "source_2_name", "source_3_name",
     ]
     if os.path.exists(path):
-        df   = pd.read_parquet(path)
+        df = pd.read_parquet(path)
         keep = [c for c in cols if c in df.columns]
         if keep:
             return df[keep].copy()
@@ -393,8 +505,6 @@ def main() -> None:
 
     rows: list[dict] = []
 
-    # Run all airports in parallel — each gets its own driver + session
-    # Max 13 workers (one per airport); GitHub Actions runners have enough RAM
     with ThreadPoolExecutor(max_workers=len(AIRPORTS)) as executor:
         futures = {
             executor.submit(process_airport, airport, meta): airport
@@ -415,13 +525,13 @@ def main() -> None:
         print("No rows fetched; nothing saved.")
         return
 
-    new_df   = pd.DataFrame(rows)
+    new_df = pd.DataFrame(rows)
     existing = load_existing(OUTPUT_PATH)
     existing = purge_old_forecasts(existing)
     combined = pd.concat([existing, new_df], ignore_index=True)
 
     combined["pulled_at_local"] = pd.to_datetime(combined["pulled_at_local"], errors="coerce")
-    for col in ["forecast_source_1", "forecast_source_2", "forecast_source_3", "forecast_avg_max"]:
+    for col in ["forecast_source_1", "forecast_source_2", "forecast_source_3", "forecast_avg_max", "observed_max_today"]:
         combined[col] = pd.to_numeric(combined[col], errors="coerce")
 
     combined = combined.dropna(subset=["airport", "pulled_at_local"]).copy()
