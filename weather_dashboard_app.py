@@ -29,11 +29,11 @@ AIRPORT_NAMES = {
 }
 
 
-def airport_label(code: str) -> str:
+def airport_label(code):
     return AIRPORT_NAMES.get(str(code), str(code))
 
 
-def load_parquet(path: str) -> pd.DataFrame:
+def load_parquet(path):
     if not os.path.exists(path):
         return pd.DataFrame()
     return pd.read_parquet(path)
@@ -45,7 +45,7 @@ def safe_float(x):
         if pd.isna(v):
             return None
         return v
-    except Exception:
+    except:
         return None
 
 
@@ -53,42 +53,42 @@ def c_to_f(x):
     x = safe_float(x)
     if x is None:
         return None
-    return x * 9.0 / 5.0 + 32.0
+    return x * 9 / 5 + 32
 
 
 def delta_c_to_f(x):
     x = safe_float(x)
     if x is None:
         return None
-    return x * 9.0 / 5.0
+    return x * 9 / 5
 
 
-def fmt_num(x, digits=1, suffix="°C"):
+def fmt_c(x):
     x = safe_float(x)
     if x is None:
         return "—"
-    return f"{x:.{digits}f}{suffix}"
+    return f"{x:.1f}°C"
 
 
-def fmt_num_f(x, digits=1):
+def fmt_f(x):
     x = c_to_f(x)
     if x is None:
         return "—"
-    return f"{x:.{digits}f}°F"
+    return f"{x:.1f}°F"
 
 
-def fmt_delta(x, digits=1, suffix="°C"):
+def fmt_delta_c(x):
     x = safe_float(x)
     if x is None:
         return "—"
-    return f"{x:+.{digits}f}{suffix}"
+    return f"{x:+.1f}°C"
 
 
-def fmt_delta_f(x, digits=1):
+def fmt_delta_f(x):
     x = delta_c_to_f(x)
     if x is None:
         return "—"
-    return f"{x:+.{digits}f}°F"
+    return f"{x:+.1f}°F"
 
 
 def fmt_ts(x):
@@ -96,29 +96,20 @@ def fmt_ts(x):
         return "—"
     try:
         return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
-    except Exception:
+    except:
         return str(x)
 
 
-def fmt_local_now_from_series(ts_series: pd.Series):
-    if ts_series is None or len(ts_series) == 0:
-        return "—"
-    x = pd.to_datetime(ts_series, errors="coerce").dropna()
-    if len(x) == 0:
-        return "—"
-    return x.max().strftime("%Y-%m-%d %H:%M")
-
-
-def rank_airports(rank_df: pd.DataFrame, obs_df: pd.DataFrame):
+def rank_airports(rank_df, obs_df):
     if not rank_df.empty and {"airport", "mae"}.issubset(rank_df.columns):
         tmp = rank_df.copy().sort_values(["mae", "airport"])
         return tmp["airport"].dropna().astype(str).tolist()
     if not obs_df.empty and "airport" in obs_df.columns:
-        return sorted(obs_df["airport"].dropna().astype(str).unique().tolist())
+        return sorted(obs_df["airport"].dropna().unique())
     return []
 
 
-def get_obs(airport: str, obs_df: pd.DataFrame) -> pd.DataFrame:
+def get_obs(airport, obs_df):
     if obs_df.empty:
         return pd.DataFrame()
     x = obs_df[obs_df["airport"] == airport].copy()
@@ -128,7 +119,7 @@ def get_obs(airport: str, obs_df: pd.DataFrame) -> pd.DataFrame:
     return x.sort_values("timestamp_local")
 
 
-def get_today_obs(airport: str, obs_df: pd.DataFrame) -> pd.DataFrame:
+def get_today_obs(airport, obs_df):
     x = get_obs(airport, obs_df)
     if x.empty:
         return x
@@ -136,7 +127,7 @@ def get_today_obs(airport: str, obs_df: pd.DataFrame) -> pd.DataFrame:
     return x[x["timestamp_local"].dt.normalize() == today].copy()
 
 
-def get_yesterday_obs(airport: str, obs_df: pd.DataFrame) -> pd.DataFrame:
+def get_yesterday_obs(airport, obs_df):
     x = get_obs(airport, obs_df)
     if x.empty:
         return x
@@ -145,11 +136,11 @@ def get_yesterday_obs(airport: str, obs_df: pd.DataFrame) -> pd.DataFrame:
     x = x[x["timestamp_local"].dt.normalize() == yesterday].copy()
     if x.empty:
         return x
-    x["display_time"] = x["timestamp_local"].dt.hour + x["timestamp_local"].dt.minute / 60.0
+    x["display_time"] = x["timestamp_local"].dt.hour + x["timestamp_local"].dt.minute / 60
     return x
 
 
-def get_model_hist(airport: str, model_df: pd.DataFrame) -> pd.DataFrame:
+def get_model_hist(airport, model_df):
     if model_df.empty:
         return pd.DataFrame()
     x = model_df[model_df["airport"] == airport].copy()
@@ -159,17 +150,17 @@ def get_model_hist(airport: str, model_df: pd.DataFrame) -> pd.DataFrame:
     return x.sort_values("run_timestamp_local")
 
 
-def get_latest_forecast(airport: str, forecast_df: pd.DataFrame) -> pd.DataFrame:
+def get_latest_forecast(airport, forecast_df):
     if forecast_df.empty:
         return pd.DataFrame()
     x = forecast_df[forecast_df["airport"] == airport].copy()
     if x.empty:
         return x
     x["pulled_at_local"] = pd.to_datetime(x["pulled_at_local"], errors="coerce")
-    return x.sort_values("pulled_at_local").tail(1).copy()
+    return x.sort_values("pulled_at_local").tail(1)
 
 
-def add_model_absolute_max(model_hist: pd.DataFrame, obs_hist: pd.DataFrame) -> pd.DataFrame:
+def add_model_absolute_max(model_hist, obs_hist):
     if model_hist.empty:
         return model_hist.copy()
 
@@ -177,53 +168,50 @@ def add_model_absolute_max(model_hist: pd.DataFrame, obs_hist: pd.DataFrame) -> 
 
     if "projected_max_temp" not in x.columns:
         x["modelled_max_abs"] = pd.NA
-        x["model_temp_at_run"] = pd.NA
         return x
 
-    if obs_hist.empty or "temp" not in obs_hist.columns:
+    if obs_hist.empty:
         x["modelled_max_abs"] = x["projected_max_temp"]
-        x["model_temp_at_run"] = pd.NA
         return x
 
-    obs = obs_hist.copy()
-    obs = obs[["timestamp_local", "temp"]].copy()
+    obs = obs_hist[["timestamp_local", "temp"]].copy()
     obs["timestamp_local"] = pd.to_datetime(obs["timestamp_local"], errors="coerce")
-    obs["temp"] = pd.to_numeric(obs["temp"], errors="coerce")
-    obs = obs.dropna(subset=["timestamp_local"]).sort_values("timestamp_local")
+    obs = obs.dropna().sort_values("timestamp_local")
 
-    mdl = x.sort_values("run_timestamp_local").copy()
+    mdl = x.sort_values("run_timestamp_local")
 
     merged = pd.merge_asof(
         mdl,
-        obs.rename(columns={"timestamp_local": "obs_timestamp_local", "temp": "model_temp_at_run"}),
+        obs.rename(columns={"timestamp_local": "obs_timestamp", "temp": "temp_at_run"}),
         left_on="run_timestamp_local",
-        right_on="obs_timestamp_local",
+        right_on="obs_timestamp",
         direction="backward",
         tolerance=pd.Timedelta("2H"),
     )
 
-    merged["projected_max_temp"] = pd.to_numeric(merged["projected_max_temp"], errors="coerce")
-    merged["model_temp_at_run"] = pd.to_numeric(merged["model_temp_at_run"], errors="coerce")
-    merged["modelled_max_abs"] = merged["model_temp_at_run"] + merged["projected_max_temp"]
+    merged["modelled_max_abs"] = merged["temp_at_run"] + merged["projected_max_temp"]
+
     merged["modelled_max_abs"] = merged["modelled_max_abs"].where(
         merged["modelled_max_abs"].notna(),
-        merged["projected_max_temp"]
+        merged["projected_max_temp"],
     )
 
     return merged
 
 
-def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forecast_df: pd.DataFrame):
+def make_chart(airport, obs_df, model_df, forecast_df):
     obs_hist = get_obs(airport, obs_df)
     today_obs = get_today_obs(airport, obs_df)
     yesterday_obs = get_yesterday_obs(airport, obs_df)
+
     model_hist_raw = get_model_hist(airport, model_df)
     model_hist = add_model_absolute_max(model_hist_raw, obs_hist)
+
     latest_fc = get_latest_forecast(airport, forecast_df)
 
     fig = go.Figure()
 
-    if not yesterday_obs.empty and "temp" in yesterday_obs.columns:
+    if not yesterday_obs.empty:
         fig.add_trace(
             go.Scatter(
                 x=yesterday_obs["display_time"],
@@ -234,8 +222,8 @@ def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forec
             )
         )
 
-    if not today_obs.empty and "temp" in today_obs.columns:
-        x_today = today_obs["timestamp_local"].dt.hour + today_obs["timestamp_local"].dt.minute / 60.0
+    if not today_obs.empty:
+        x_today = today_obs["timestamp_local"].dt.hour + today_obs["timestamp_local"].dt.minute / 60
         fig.add_trace(
             go.Scatter(
                 x=x_today,
@@ -246,18 +234,8 @@ def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forec
             )
         )
 
-    if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
-        blue_scale = [
-            "#dbeafe", "#bfdbfe", "#93c5fd", "#60a5fa", "#3b82f6",
-            "#2563eb", "#1d4ed8", "#1e40af", "#1e3a8a"
-        ]
-        n = len(model_hist)
-        colors = (
-            blue_scale[-n:]
-            if n <= len(blue_scale)
-            else [blue_scale[min(int(i * len(blue_scale) / n), len(blue_scale) - 1)] for i in range(n)]
-        )
-        for i, (_, row) in enumerate(model_hist.iterrows()):
+    if not model_hist.empty:
+        for _, row in model_hist.iterrows():
             y = safe_float(row.get("modelled_max_abs"))
             if y is None:
                 continue
@@ -267,12 +245,12 @@ def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forec
                     y=[y, y],
                     mode="lines",
                     name="Modelled max",
-                    line=dict(color=colors[i], width=2),
-                    showlegend=(i == n - 1),
+                    line=dict(color="#2563eb", width=2),
+                    showlegend=False,
                 )
             )
 
-    if not latest_fc.empty and "forecast_avg_max" in latest_fc.columns:
+    if not latest_fc.empty:
         y = safe_float(latest_fc["forecast_avg_max"].iloc[0])
         if y is not None:
             fig.add_trace(
@@ -286,9 +264,16 @@ def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forec
             )
 
     fig.update_layout(
-        title=airport_label(airport),
+        title=dict(
+            text=airport_label(airport),
+            x=0,
+            xanchor="left",
+            y=0.97,
+            yanchor="top",
+            font=dict(size=32),
+        ),
         height=340,
-        margin=dict(l=10, r=10, t=55, b=10),
+        margin=dict(l=10, r=10, t=100, b=10),
         xaxis=dict(
             title="Local hour",
             range=[0, 24],
@@ -300,57 +285,54 @@ def make_chart(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forec
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         template="plotly_white",
     )
+
     return fig
 
 
-def airport_stats(airport: str, obs_df: pd.DataFrame, model_df: pd.DataFrame, forecast_df: pd.DataFrame):
-    obs_hist = get_obs(airport, obs_df)
+def airport_stats(airport, obs_df, model_df, forecast_df):
+
     today_obs = get_today_obs(airport, obs_df)
-    model_hist_raw = get_model_hist(airport, model_df)
-    model_hist = add_model_absolute_max(model_hist_raw, obs_hist)
+    model_hist = get_model_hist(airport, model_df)
     latest_fc = get_latest_forecast(airport, forecast_df)
 
     current_temp = None
     obs_updated = None
+
     if not today_obs.empty:
-        row = today_obs.tail(1).iloc[0]
-        current_temp = safe_float(row.get("temp"))
-        obs_updated = row.get("timestamp_local")
+        row = today_obs.iloc[-1]
+        current_temp = safe_float(row["temp"])
+        obs_updated = row["timestamp_local"]
 
-    model_now = model_prev = model_updated = None
+    model_now = None
+    model_prev = None
+    model_updated = None
+
     if not model_hist.empty:
-        last_row = model_hist.iloc[-1]
-        model_now = safe_float(last_row.get("modelled_max_abs"))
-        model_updated = last_row.get("run_timestamp_local")
+        model_now = safe_float(model_hist["projected_max_temp"].iloc[-1])
+        model_updated = model_hist["run_timestamp_local"].iloc[-1]
         if len(model_hist) >= 2:
-            model_prev = safe_float(model_hist["modelled_max_abs"].iloc[-2])
+            model_prev = safe_float(model_hist["projected_max_temp"].iloc[-2])
 
-    fc_avg = fc1 = fc2 = fc3 = fc_prev = fc_updated = None
+    fc_avg = fc1 = fc2 = fc3 = None
+    fc_updated = None
+    fc_prev = None
+
     if not latest_fc.empty:
         row = latest_fc.iloc[0]
-        fc_avg = safe_float(row.get("forecast_avg_max"))
-        fc1 = safe_float(row.get("forecast_source_1"))
-        fc2 = safe_float(row.get("forecast_source_2"))
-        fc3 = safe_float(row.get("forecast_source_3"))
-        fc_updated = row.get("pulled_at_local")
-
-    if not forecast_df.empty:
-        x = forecast_df[forecast_df["airport"] == airport].copy()
-        if not x.empty:
-            x["pulled_at_local"] = pd.to_datetime(x["pulled_at_local"], errors="coerce")
-            x = x.sort_values("pulled_at_local")
-            if len(x) >= 2 and "forecast_avg_max" in x.columns:
-                fc_prev = safe_float(x["forecast_avg_max"].iloc[-2])
+        fc_avg = safe_float(row["forecast_avg_max"])
+        fc1 = safe_float(row["forecast_source_1"])
+        fc2 = safe_float(row["forecast_source_2"])
+        fc3 = safe_float(row["forecast_source_3"])
+        fc_updated = row["pulled_at_local"]
 
     return {
         "current_temp": current_temp,
         "model_now": model_now,
-        "model_delta": None if model_now is None or model_prev is None else model_now - model_prev,
+        "model_delta": None if model_prev is None else model_now - model_prev,
         "fc_avg": fc_avg,
         "fc1": fc1,
         "fc2": fc2,
         "fc3": fc3,
-        "fc_delta": None if fc_avg is None or fc_prev is None else fc_avg - fc_prev,
         "obs_updated": obs_updated,
         "model_updated": model_updated,
         "fc_updated": fc_updated,
@@ -363,59 +345,59 @@ forecast_df = load_parquet(FORECAST_PATH)
 rank_df = load_parquet(RANK_PATH)
 
 st.title("Airport Max Temperature Dashboard")
-st.caption(f"Auto-refresh target: every {AUTO_REFRESH_SECONDS // 60} minutes")
+st.caption(f"Auto-refresh target: every {AUTO_REFRESH_SECONDS//60} minutes")
 
 airports = rank_airports(rank_df, obs_df)
-if not airports:
-    st.warning("No airports found. Populate dashboard parquet files first.")
-    st.stop()
 
 for airport in airports:
+
     st.markdown("---")
-    chart_col, stat_col = st.columns([4.6, 1.4], gap="medium")
+
+    chart_col, stat_col = st.columns([4.6, 1.4])
 
     with chart_col:
-        st.plotly_chart(make_chart(airport, obs_df, model_df, forecast_df), use_container_width=True)
+        st.plotly_chart(
+            make_chart(airport, obs_df, model_df, forecast_df),
+            use_container_width=True,
+        )
 
     s = airport_stats(airport, obs_df, model_df, forecast_df)
     airport_obs = get_obs(airport, obs_df)
 
     with stat_col:
-        st.markdown(f"**Local time now**  \n{fmt_local_now_from_series(airport_obs.get('timestamp_local', pd.Series(dtype='datetime64[ns]')))}")
+
+        local_time = "—"
+        if not airport_obs.empty:
+            local_time = airport_obs["timestamp_local"].max().strftime("%Y-%m-%d %H:%M")
+
+        st.markdown(f"**Local time now**  \n{local_time}")
 
         st.markdown("")
 
         st.markdown(
-            f"**Current temp**  \n"
-            f"{fmt_num(s['current_temp'])}   |   {fmt_num_f(s['current_temp'])}"
+            f"**Current temp**  \n{fmt_c(s['current_temp'])} | {fmt_f(s['current_temp'])}"
         )
 
         st.markdown("")
 
         st.markdown(
-            f"**Modelled max**  \n"
-            f"{fmt_num(s['model_now'])}   |   {fmt_num_f(s['model_now'])}  \n"
-            f"<span style='color:gray;font-size:12px'>"
-            f"{fmt_delta(s['model_delta'])} / {fmt_delta_f(s['model_delta'])} vs last model"
-            f"</span>",
-            unsafe_allow_html=True,
+            f"**Modelled max**  \n{fmt_c(s['model_now'])} | {fmt_f(s['model_now'])}"
         )
 
         st.markdown("")
 
         st.markdown(
             f"**Forecast max**  \n"
-            f"Avg: {fmt_num(s['fc_avg'])}   |   {fmt_num_f(s['fc_avg'])}  \n"
-            f"S1: {fmt_num(s['fc1'])}   |   {fmt_num_f(s['fc1'])}  \n"
-            f"S2: {fmt_num(s['fc2'])}   |   {fmt_num_f(s['fc2'])}  \n"
-            f"S3: {fmt_num(s['fc3'])}   |   {fmt_num_f(s['fc3'])}  \n"
-            f"<span style='color:gray;font-size:12px'>"
-            f"{fmt_delta(s['fc_delta'])} / {fmt_delta_f(s['fc_delta'])} vs last forecast"
-            f"</span>",
-            unsafe_allow_html=True,
+            f"Avg: {fmt_c(s['fc_avg'])} | {fmt_f(s['fc_avg'])}  \n"
+            f"S1: {fmt_c(s['fc1'])} | {fmt_f(s['fc1'])}  \n"
+            f"S2: {fmt_c(s['fc2'])} | {fmt_f(s['fc2'])}  \n"
+            f"S3: {fmt_c(s['fc3'])} | {fmt_f(s['fc3'])}"
         )
 
+        st.markdown("")
+
         st.markdown("**Last updated**")
+
         st.caption(
             f"Obs: {fmt_ts(s['obs_updated'])}\n\n"
             f"Model: {fmt_ts(s['model_updated'])}\n\n"
