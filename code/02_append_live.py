@@ -23,7 +23,7 @@ STATIONS = {
     "SEL": {"station_id": "RKSI"},
     "ANK": {"station_id": "LTAC"},
     "BUE": {"station_id": "SAEZ"},
-    "LON": {"station_id": "EGLL"},
+    "LON": {"station_id": "EGLC"},
     "WLG": {"station_id": "NZWN"},
 }
 
