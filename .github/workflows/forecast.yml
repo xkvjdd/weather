@@ -1,7 +1,7 @@
 name: Build Forecast Latest
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "8,18,28,38,48,58 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas pyarrow requests beautifulsoup4
+          pip install pandas pyarrow requests beautifulsoup4 selenium webdriver-manager
       - name: Run forecast builder
         run: |
           python code/03_forecast.py
