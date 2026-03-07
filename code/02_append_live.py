@@ -105,9 +105,10 @@ def parse_timestamp_from_page(timestamp_text: str) -> pd.Timestamp | None:
 
     s = " ".join(str(timestamp_text).split())
     s = re.sub(r"^access_time\s*", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s*\|\s*Updated.*$", "", s, flags=re.IGNORECASE).strip()
 
     m = re.search(
-        r"(\d{1,2}:\d{2}\s*[AP]M)\s+[A-Z]{2,5}\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+        r"(\d{1,2}:\d{2}\s*[AP]M).*?\bon\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})",
         s,
         flags=re.IGNORECASE,
     )
