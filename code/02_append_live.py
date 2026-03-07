@@ -10,19 +10,19 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 STATIONS = {
-    "ATL": {"weather_path": "us/ga/atlanta/KATL"},
-    "NYC": {"weather_path": "us/ny/new-york/KLGA"},
-    "CHI": {"weather_path": "us/il/chicago/KORD"},
-    "DAL": {"weather_path": "us/tx/dallas/KDAL"},
-    "SEA": {"weather_path": "us/wa/seattle/KSEA"},
-    "MIA": {"weather_path": "us/fl/miami/KMIA"},
-    "TOR": {"weather_path": "ca/on/toronto/CYYZ"},
-    "PAR": {"weather_path": "fr/paris/LFPG"},
-    "SEL": {"weather_path": "kr/incheon/RKSI"},
-    "ANK": {"weather_path": "tr/ankara/LTAC"},
-    "BUE": {"weather_path": "ar/buenos-aires/SAEZ"},
-    "LON": {"weather_path": "gb/england/london/EGLL"},
-    "WLG": {"weather_path": "nz/wellington/NZWN"},
+    "ATL": {"station_id": "KATL"},
+    "NYC": {"station_id": "KLGA"},
+    "CHI": {"station_id": "KORD"},
+    "DAL": {"station_id": "KDAL"},
+    "SEA": {"station_id": "KSEA"},
+    "MIA": {"station_id": "KMIA"},
+    "TOR": {"station_id": "CYYZ"},
+    "PAR": {"station_id": "LFPG"},
+    "SEL": {"station_id": "RKSI"},
+    "ANK": {"station_id": "LTAC"},
+    "BUE": {"station_id": "SAEZ"},
+    "LON": {"station_id": "EGLL"},
+    "WLG": {"station_id": "NZWN"},
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,8 +47,8 @@ def make_driver() -> webdriver.Chrome:
     return webdriver.Chrome(options=options)
 
 
-def build_weather_url(weather_path: str) -> str:
-    return f"https://www.wunderground.com/weather/{weather_path}"
+def build_weather_url(station_id: str) -> str:
+    return f"https://www.wunderground.com/weather/{station_id}"
 
 
 def wait_for_weather_page(driver: webdriver.Chrome, timeout: int = 30) -> None:
@@ -56,18 +56,32 @@ def wait_for_weather_page(driver: webdriver.Chrome, timeout: int = 30) -> None:
         EC.presence_of_element_located((By.CSS_SELECTOR, "p.timestamp"))
     )
     WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "span.wu-value-to"))
+        EC.presence_of_element_located(
+            (
+                By.XPATH,
+                '//div[contains(@class,"current-temp")]//span[contains(@class,"wu-unit-temperature")]',
+            )
+        )
     )
 
 
-def parse_temp(temp_text: str) -> float | None:
+def parse_temp_to_celsius(temp_text: str) -> float | None:
     if temp_text is None:
         return None
-    s = str(temp_text).replace("°C", "").replace("°", "").strip()
-    try:
-        return float(s)
-    except Exception:
+
+    s = " ".join(str(temp_text).replace("\xa0", " ").split()).strip()
+
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?", s, flags=re.IGNORECASE)
+    if not m:
         return None
+
+    value = float(m.group(1))
+    unit = (m.group(2) or "C").upper()
+
+    if unit == "F":
+        return round((value - 32.0) * 5.0 / 9.0, 3)
+
+    return value
 
 
 def parse_timestamp_from_page(timestamp_text: str) -> pd.Timestamp | None:
@@ -75,9 +89,8 @@ def parse_timestamp_from_page(timestamp_text: str) -> pd.Timestamp | None:
         return None
 
     s = " ".join(str(timestamp_text).split())
+    s = re.sub(r"^access_time\s*", "", s, flags=re.IGNORECASE).strip()
 
-    # Example:
-    # 6:14 AM NZDT on March 7, 2026 (GMT +13) Updated just now
     m = re.search(
         r"(\d{1,2}:\d{2}\s*[AP]M)\s+[A-Z]{2,5}\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})",
         s,
@@ -99,29 +112,32 @@ def parse_timestamp_from_page(timestamp_text: str) -> pd.Timestamp | None:
     return ts
 
 
-def fetch_station_row(driver: webdriver.Chrome, airport: str, weather_path: str) -> dict:
-    url = build_weather_url(weather_path)
+def fetch_station_row(driver: webdriver.Chrome, airport: str, station_id: str) -> dict:
+    url = build_weather_url(station_id)
     print(f"  loading {url}")
 
     driver.get(url)
     wait_for_weather_page(driver)
 
     timestamp_text = driver.find_element(By.CSS_SELECTOR, "p.timestamp").text
-    temp_text = driver.find_element(By.CSS_SELECTOR, "span.wu-value-to").text
+    temp_text = driver.find_element(
+        By.XPATH,
+        '//div[contains(@class,"current-temp")]//span[contains(@class,"wu-unit-temperature")]',
+    ).text
 
     timestamp_local = parse_timestamp_from_page(timestamp_text)
-    temp = parse_temp(temp_text)
+    temp_c = parse_temp_to_celsius(temp_text)
 
     if timestamp_local is None:
         raise RuntimeError(f"could not parse local timestamp from: {timestamp_text}")
 
-    if temp is None:
+    if temp_c is None:
         raise RuntimeError(f"could not parse temp from: {temp_text}")
 
     return {
         "airport": airport,
         "timestamp_local": timestamp_local,
-        "temp": temp,
+        "temp": temp_c,
     }
 
 
@@ -142,9 +158,9 @@ def main() -> None:
         for airport, meta in STATIONS.items():
             print(f"Fetching {airport}")
             try:
-                row = fetch_station_row(driver, airport, meta["weather_path"])
+                row = fetch_station_row(driver, airport, meta["station_id"])
                 rows.append(row)
-                print(f"  local={row['timestamp_local']} temp={row['temp']}")
+                print(f"  local={row['timestamp_local']} temp_c={row['temp']}")
             except Exception as e:
                 print(f"  FAILED: {e}")
 
