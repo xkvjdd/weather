@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: append-live
+  cancel-in-progress: false
+
 jobs:
   append_live:
     runs-on: ubuntu-latest
@@ -17,6 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -35,6 +40,12 @@ jobs:
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
+
           git add data/dashboard/observations.parquet
-          git diff --cached --quiet || git commit -m "append live observations"
-          git push
+
+          git diff --cached --quiet && exit 0
+
+          git commit -m "append live observations"
+
+          git pull --rebase origin main
+          git push origin main
