@@ -38,19 +38,19 @@ AIRPORTS = {
 }
 
 BBC_WEATHER_URLS = {
-    "ATL": "https://www.bbc.com/weather/4199556",  # Hartsfield–Jackson Atlanta International Airport
-    "NYC": "https://www.bbc.com/weather/5123698",  # La Guardia Airport
-    "CHI": "https://www.bbc.com/weather/4887479",  # Chicago O'Hare International Airport
-    "DAL": "https://www.bbc.com/weather/4684888",  # Dallas (TX) page; observation station is Dallas Love Field
-    "SEA": "https://www.bbc.com/weather/5809876",  # Seattle-Tacoma International Airport
-    "MIA": "https://www.bbc.com/weather/4164181",  # Miami International Airport
-    "TOR": "https://www.bbc.com/weather/6296338",  # Toronto Pearson International Airport
-    "PAR": "https://www.bbc.com/weather/6269554",  # Paris Charles de Gaulle Airport
-    "SEL": "https://www.bbc.com/weather/1835848",  # Seoul fallback; BBC did not expose a working Incheon airport page
-    "ANK": "https://www.bbc.com/weather/6299725",  # Ankara Esenboğa International Airport
-    "BUE": "https://www.bbc.com/weather/6300524",  # Ministro Pistarini International Airport (Ezeiza)
-    "LON": "https://www.bbc.com/weather/6296599",  # London City Airport
-    "WLG": "https://www.bbc.com/weather/6244688",  # Wellington International Airport
+    "ATL": "https://www.bbc.com/weather/4199556",
+    "NYC": "https://www.bbc.com/weather/5123698",
+    "CHI": "https://www.bbc.com/weather/4887479",
+    "DAL": "https://www.bbc.com/weather/4684888",
+    "SEA": "https://www.bbc.com/weather/5809876",
+    "MIA": "https://www.bbc.com/weather/4164181",
+    "TOR": "https://www.bbc.com/weather/6296338",
+    "PAR": "https://www.bbc.com/weather/6269554",
+    "SEL": "https://www.bbc.com/weather/1835848",
+    "ANK": "https://www.bbc.com/weather/6299725",
+    "BUE": "https://www.bbc.com/weather/6300524",
+    "LON": "https://www.bbc.com/weather/6296599",
+    "WLG": "https://www.bbc.com/weather/6244688",
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,6 +75,13 @@ HEADERS = {
         "Chrome/145.0.0.0 Safari/537.36"
     )
 }
+
+FORECAST_COLS = [
+    "airport", "icao", "forecast_date_local", "pulled_at_local",
+    "forecast_source_1", "forecast_source_2", "forecast_source_3",
+    "forecast_avg_max", "observed_max_today",
+    "source_1_name", "source_2_name", "source_3_name",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +334,15 @@ def fetch_bbc_today_high_requests(
 def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+
+    if "forecast_date_local" not in df.columns:
+        print("  Existing parquet missing forecast_date_local; dropping old existing rows")
+        return pd.DataFrame(columns=FORECAST_COLS)
+
+    if "airport" not in df.columns:
+        print("  Existing parquet missing airport; dropping old existing rows")
+        return pd.DataFrame(columns=FORECAST_COLS)
+
     keep_mask = df.apply(
         lambda row: row["forecast_date_local"] == today_local_str(
             AIRPORTS.get(row["airport"], {}).get("tz", "UTC")
@@ -336,7 +352,7 @@ def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
     dropped = int((~keep_mask).sum())
     if dropped:
         print(f"  Purged {dropped} row(s) from previous local days")
-    return df[keep_mask].reset_index(drop=True)
+    return df.loc[keep_mask].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -403,18 +419,20 @@ def process_airport(airport: str, meta: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def load_existing(path: str) -> pd.DataFrame:
-    cols = [
-        "airport", "icao", "forecast_date_local", "pulled_at_local",
-        "forecast_source_1", "forecast_source_2", "forecast_source_3",
-        "forecast_avg_max", "observed_max_today",
-        "source_1_name", "source_2_name", "source_3_name",
-    ]
-    if os.path.exists(path):
-        df = pd.read_parquet(path)
-        keep = [c for c in cols if c in df.columns]
-        if keep:
-            return df[keep].copy()
-    return pd.DataFrame(columns=cols)
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=FORECAST_COLS)
+
+    try:
+        df = pd.read_parquet(path).copy()
+    except Exception as e:
+        print(f"WARNING: could not read existing parquet {path}: {e}")
+        return pd.DataFrame(columns=FORECAST_COLS)
+
+    for col in FORECAST_COLS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    return df[FORECAST_COLS].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +465,11 @@ def main() -> None:
         return
 
     new_df = pd.DataFrame(rows)
+    for col in FORECAST_COLS:
+        if col not in new_df.columns:
+            new_df[col] = pd.NA
+    new_df = new_df[FORECAST_COLS].copy()
+
     existing = load_existing(OUTPUT_PATH)
     existing = purge_old_forecasts(existing)
     combined = pd.concat([existing, new_df], ignore_index=True)
