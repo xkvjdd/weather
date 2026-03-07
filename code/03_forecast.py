@@ -12,7 +12,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-MAX_WORKERS = 16
+MAX_WORKERS_HTTP = 24
+MAX_WORKERS_SELENIUM = 3
 TIMEOUT = 12
 
 HEADERS = {
@@ -36,7 +37,7 @@ AIRPORT_META = {
     "SEL": {"name": "Incheon International Airport", "tz": "Asia/Seoul"},
     "ANK": {"name": "Esenboga Airport", "tz": "Europe/Istanbul"},
     "BUE": {"name": "Ezeiza International Airport", "tz": "America/Argentina/Buenos_Aires"},
-    "LON": {"name": "Heathrow Airport", "tz": "Europe/London"},
+    "LON": {"name": "London City Airport", "tz": "Europe/London"},
     "WLG": {"name": "Wellington Airport", "tz": "Pacific/Auckland"},
 }
 
@@ -100,9 +101,9 @@ AIRPORT_LINKS = {
         "S3": "https://weather.com/weather/tenday/l/-34.8222,-58.5358",
     },
     "LON": {
-        "S1": "https://www.accuweather.com/en/gb/heathrow/328328/weather-forecast/328328",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/51.4775,-0.4614",
+        "S1": "https://www.accuweather.com/en/gb/london-city-airport/e16-2/weather-forecast/5375_poi",
+        "S2": "https://www.bbc.com/weather/6296599",
+        "S3": "https://weather.com/weather/tenday/l/51.5053,-0.0553",
     },
     "WLG": {
         "S1": "https://www.accuweather.com/en/nz/wellington/250938/weather-forecast/250938",
@@ -138,7 +139,7 @@ def first_int(text: str):
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
-    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=1)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
@@ -156,11 +157,12 @@ def fetch_text(session: requests.Session, url: str):
 
 
 def make_edge_driver() -> webdriver.Edge:
-    """Create a headless Edge driver that mimics a real browser."""
     opts = webdriver.EdgeOptions()
     opts.add_argument("--headless")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1400,2000")
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -168,27 +170,26 @@ def make_edge_driver() -> webdriver.Edge:
     )
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+
     driver = webdriver.Edge(options=opts)
+    driver.set_page_load_timeout(30)
     driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
     return driver
 
 
 def fetch_weathercom_selenium(url: str):
-    """
-    Fetch weather.com page using Selenium/Edge and return
-    (html_source, final_url, error_or_None).
-    Each call creates and quits its own driver to stay thread-safe.
-    """
     if not url:
         return None, None, "blank_url"
+
     driver = None
     try:
         driver = make_edge_driver()
         driver.get(url)
-        # Wait until at least one TemperatureValue span is present
-        WebDriverWait(driver, 30).until(
+
+        WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="TemperatureValue"]'))
         )
+
         html = driver.page_source
         final_url = driver.current_url
         return html, final_url, None
@@ -209,30 +210,60 @@ def fetch_weathercom_selenium(url: str):
 def parse_accuweather_today_high(code: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    for idx, card in enumerate(soup.select("div.today-forecast-card")):
-        for b in card.select("b"):
-            txt = clean_text(b.get_text(" ", strip=True))
-            m = re.search(r"\bHi\s*:\s*(-?\d+)", txt, flags=re.I)
-            if m:
-                c = int(m.group(1))
-                return {"temp_c": c, "temp_f": c_to_f(c), "method": f"accuweather_today_card_b_{idx}", "match_text": txt}
+    # 1) Best path: 10-day list row high temp span
+    for idx, row in enumerate(soup.select("a.daily-list-item")):
+        hi = row.select_one("span.temp-hi")
+        if hi:
+            c = first_int(hi.get_text(" ", strip=True))
+            if c is not None:
+                row_text = clean_text(row.get_text(" ", strip=True))
+                return {
+                    "temp_c": c,
+                    "temp_f": c_to_f(c),
+                    "method": f"accuweather_daily_list_temp_hi_{idx}",
+                    "match_text": row_text[:300],
+                }
 
-        card_text = clean_text(card.get_text(" ", strip=True))
-        m = re.search(r"\bHi\s*:\s*(-?\d+)", card_text, flags=re.I)
+    # 2) Today's weather card text like "Hi: 28°"
+    for idx, card in enumerate(soup.select("div.today-forecast-card")):
+        txt = clean_text(card.get_text(" ", strip=True))
+        m = re.search(r"\bHi\s*:\s*(-?\d+)", txt, flags=re.I)
         if m:
             c = int(m.group(1))
-            return {"temp_c": c, "temp_f": c_to_f(c), "method": f"accuweather_today_card_text_{idx}", "match_text": card_text[:300]}
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": f"accuweather_today_card_{idx}",
+                "match_text": txt[:300],
+            }
 
+    # 3) Generic span fallback
+    hi = soup.select_one("span.temp-hi")
+    if hi:
+        c = first_int(hi.get_text(" ", strip=True))
+        if c is not None:
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": "accuweather_span_temp_hi",
+                "match_text": clean_text(hi.get_text(" ", strip=True)),
+            }
+
+    # 4) Raw HTML fallback
     raw_patterns = [
-        r'today-forecast-card.*?\bHi\s*:\s*(-?\d+)',
-        r"\bTODAY'S WEATHER\b.{0,500}?\bHi\s*:\s*(-?\d+)",
+        r'<span[^>]*class="[^"]*temp-hi[^"]*"[^>]*>\s*(-?\d+)\s*°?\s*</span>',
         r"\bHi\s*:\s*(-?\d+)\s*°",
     ]
     for i, patt in enumerate(raw_patterns, start=1):
         m = re.search(patt, html, flags=re.I | re.S)
         if m:
             c = int(m.group(1))
-            return {"temp_c": c, "temp_f": c_to_f(c), "method": f"accuweather_regex_{i}", "match_text": m.group(0)[:300]}
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": f"accuweather_regex_{i}",
+                "match_text": m.group(0)[:300],
+            }
 
     return None
 
@@ -258,7 +289,12 @@ def parse_bbc_today_high(code: str, html: str):
         m = re.search(patt, source_text, flags=re.I | re.S)
         if m:
             c = int(m.group(1))
-            return {"temp_c": c, "temp_f": c_to_f(c), "method": f"bbc_p{i}", "match_text": m.group(0)[:300]}
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": f"bbc_p{i}",
+                "match_text": m.group(0)[:300],
+            }
 
     return None
 
@@ -330,74 +366,174 @@ def parse_source(code: str, source: str, html: str):
     return None
 
 
-def fetch_one(session: requests.Session, code: str, source: str, url: str):
-    # Weather.com (S3) requires Selenium; all others use requests
-    if source == "S3":
-        html, final_url, err = fetch_weathercom_selenium(url)
-    else:
-        html, final_url, err = fetch_text(session, url)
+def empty_row(code: str):
+    return {
+        "code": code,
+        "airport": AIRPORT_META[code]["name"],
+        "local_now": now_local(code).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "S1_url": AIRPORT_LINKS[code]["S1"],
+        "S2_url": AIRPORT_LINKS[code]["S2"],
+        "S3_url": AIRPORT_LINKS[code]["S3"],
+        "S1_final_url": None,
+        "S2_final_url": None,
+        "S3_final_url": None,
+        "S1_temp_c": None,
+        "S1_temp_f": None,
+        "S1_method": None,
+        "S1_error": None,
+        "S1_match_text": None,
+        "S2_temp_c": None,
+        "S2_temp_f": None,
+        "S2_method": None,
+        "S2_error": None,
+        "S2_match_text": None,
+        "S3_temp_c": None,
+        "S3_temp_f": None,
+        "S3_method": None,
+        "S3_error": None,
+        "S3_match_text": None,
+    }
+
+
+def fetch_one_http(session: requests.Session, code: str, source: str, url: str):
+    html, final_url, err = fetch_text(session, url)
 
     if err:
         return {
-            "code": code, "source": source, "url": url, "final_url": final_url,
-            "ok": False, "error": err,
-            "temp_c": None, "temp_f": None, "method": None, "match_text": None,
+            "code": code,
+            "source": source,
+            "url": url,
+            "final_url": final_url,
+            "ok": False,
+            "error": err,
+            "temp_c": None,
+            "temp_f": None,
+            "method": None,
+            "match_text": None,
         }
 
     parsed = parse_source(code, source, html)
     if not parsed:
         return {
-            "code": code, "source": source, "url": url, "final_url": final_url,
-            "ok": False, "error": "parse_failed",
-            "temp_c": None, "temp_f": None, "method": None, "match_text": None,
+            "code": code,
+            "source": source,
+            "url": url,
+            "final_url": final_url,
+            "ok": False,
+            "error": "parse_failed",
+            "temp_c": None,
+            "temp_f": None,
+            "method": None,
+            "match_text": None,
         }
 
     return {
-        "code": code, "source": source, "url": url, "final_url": final_url,
-        "ok": True, "error": None,
-        "temp_c": parsed["temp_c"], "temp_f": parsed["temp_f"],
-        "method": parsed["method"], "match_text": parsed.get("match_text"),
+        "code": code,
+        "source": source,
+        "url": url,
+        "final_url": final_url,
+        "ok": True,
+        "error": None,
+        "temp_c": parsed["temp_c"],
+        "temp_f": parsed["temp_f"],
+        "method": parsed["method"],
+        "match_text": parsed.get("match_text"),
     }
+
+
+def fetch_one_selenium(code: str, source: str, url: str):
+    html, final_url, err = fetch_weathercom_selenium(url)
+
+    if err:
+        return {
+            "code": code,
+            "source": source,
+            "url": url,
+            "final_url": final_url,
+            "ok": False,
+            "error": err,
+            "temp_c": None,
+            "temp_f": None,
+            "method": None,
+            "match_text": None,
+        }
+
+    parsed = parse_source(code, source, html)
+    if not parsed:
+        return {
+            "code": code,
+            "source": source,
+            "url": url,
+            "final_url": final_url,
+            "ok": False,
+            "error": "parse_failed",
+            "temp_c": None,
+            "temp_f": None,
+            "method": None,
+            "match_text": None,
+        }
+
+    return {
+        "code": code,
+        "source": source,
+        "url": url,
+        "final_url": final_url,
+        "ok": True,
+        "error": None,
+        "temp_c": parsed["temp_c"],
+        "temp_f": parsed["temp_f"],
+        "method": parsed["method"],
+        "match_text": parsed.get("match_text"),
+    }
+
+
+def apply_result(results: dict, row: dict):
+    code = row["code"]
+    source = row["source"]
+    results[code][f"{source}_final_url"] = row["final_url"]
+    results[code][f"{source}_error"] = row["error"]
+    results[code][f"{source}_temp_c"] = row["temp_c"]
+    results[code][f"{source}_temp_f"] = row["temp_f"]
+    results[code][f"{source}_method"] = row["method"]
+    results[code][f"{source}_match_text"] = row["match_text"]
 
 
 def process_all():
-    results = {
-        code: {
-            "code": code,
-            "airport": AIRPORT_META[code]["name"],
-            "local_now": now_local(code).strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "S1_url": AIRPORT_LINKS[code]["S1"],
-            "S2_url": AIRPORT_LINKS[code]["S2"],
-            "S3_url": AIRPORT_LINKS[code]["S3"],
-            "S1_final_url": None, "S2_final_url": None, "S3_final_url": None,
-            "S1_temp_c": None, "S1_temp_f": None, "S1_method": None, "S1_error": None, "S1_match_text": None,
-            "S2_temp_c": None, "S2_temp_f": None, "S2_method": None, "S2_error": None, "S2_match_text": None,
-            "S3_temp_c": None, "S3_temp_f": None, "S3_method": None, "S3_error": None, "S3_match_text": None,
-        }
-        for code in AIRPORT_META
-    }
+    results = {code: empty_row(code) for code in AIRPORT_META}
 
-    jobs = []
+    http_jobs = []
+    selenium_jobs = []
+
+    for code, links in AIRPORT_LINKS.items():
+        for source in ("S1", "S2", "S3"):
+            url = links.get(source, "")
+            if not url:
+                results[code][f"{source}_error"] = "blank_url"
+                continue
+
+            if source == "S3":
+                selenium_jobs.append((code, source, url))
+            else:
+                http_jobs.append((code, source, url))
+
     with make_session() as session:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            for code, links in AIRPORT_LINKS.items():
-                for source in ("S1", "S2", "S3"):
-                    url = links.get(source, "")
-                    if url:
-                        jobs.append(ex.submit(fetch_one, session, code, source, url))
-                    else:
-                        results[code][f"{source}_error"] = "blank_url"
+        if http_jobs:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS_HTTP) as ex:
+                futures = [
+                    ex.submit(fetch_one_http, session, code, source, url)
+                    for code, source, url in http_jobs
+                ]
+                for fut in as_completed(futures):
+                    apply_result(results, fut.result())
 
-            for fut in as_completed(jobs):
-                row = fut.result()
-                code = row["code"]
-                source = row["source"]
-                results[code][f"{source}_final_url"] = row["final_url"]
-                results[code][f"{source}_error"] = row["error"]
-                results[code][f"{source}_temp_c"] = row["temp_c"]
-                results[code][f"{source}_temp_f"] = row["temp_f"]
-                results[code][f"{source}_method"] = row["method"]
-                results[code][f"{source}_match_text"] = row["match_text"]
+    if selenium_jobs:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_SELENIUM) as ex:
+            futures = [
+                ex.submit(fetch_one_selenium, code, source, url)
+                for code, source, url in selenium_jobs
+            ]
+            for fut in as_completed(futures):
+                apply_result(results, fut.result())
 
     return list(results.values())
 
