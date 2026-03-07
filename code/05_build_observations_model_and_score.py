@@ -445,8 +445,25 @@ def main() -> None:
     print(f"Saved observations model rows: {len(obs_model_today):,} -> {OBS_MODEL_PATH}")
 
     scored = score_latest_rows(obs_model_today, models, required_model_cols)
+ 
+    forecast_cols = [
+        "airport",
+        "run_timestamp_local",
+        "model_bucket",
+        "hours_to_peak",
+        "solar_noon_local",
+        "peak_offset_hours",
+        "predicted_peak_time_local",
+        "projected_max_temp",
+        "projected_q50",
+        "projected_q90",
+        "projected_q95",
+    ]
+    
     if scored.empty:
-        print("No forecast model rows scored. Exiting after observations_model save.")
+        print("No forecast model rows scored. Writing empty forecast_model.parquet.")
+        if not FORECAST_MODEL_PATH.exists():
+            pd.DataFrame(columns=forecast_cols).to_parquet(FORECAST_MODEL_PATH, index=False)
         return
 
     forecast_cols = [
