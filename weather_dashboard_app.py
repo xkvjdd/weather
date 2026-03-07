@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -181,6 +182,68 @@ def add_model_absolute_max(model_hist, obs_hist):
     return merged
 
 
+def get_forecast_quantile_columns(df):
+    if df.empty:
+        return []
+
+    cols = []
+    for c in df.columns:
+        cl = str(c).lower()
+        if "quantile" in cl or re.search(r"\bq\d+\b", cl):
+            cols.append(c)
+        elif re.search(r"\bp(0?\d|[1-9]\d|100)\b", cl):
+            cols.append(c)
+
+    def sort_key(col):
+        s = str(col).lower()
+
+        m = re.search(r"quantile[_\- ]*([0-9]*\.?[0-9]+)", s)
+        if m:
+            try:
+                v = float(m.group(1))
+                if v <= 1:
+                    v *= 100
+                return v
+            except Exception:
+                pass
+
+        m = re.search(r"\bq([0-9]+)\b", s)
+        if m:
+            return float(m.group(1))
+
+        m = re.search(r"\bp([0-9]+)\b", s)
+        if m:
+            return float(m.group(1))
+
+        return 9999
+
+    return sorted(cols, key=sort_key)
+
+
+def pretty_quantile_name(col):
+    s = str(col)
+
+    m = re.search(r"quantile[_\- ]*([0-9]*\.?[0-9]+)", s.lower())
+    if m:
+        try:
+            v = float(m.group(1))
+            if v <= 1:
+                v *= 100
+            return f"Q{int(round(v))}"
+        except Exception:
+            pass
+
+    m = re.search(r"\bq([0-9]+)\b", s.lower())
+    if m:
+        return f"Q{m.group(1)}"
+
+    m = re.search(r"\bp([0-9]+)\b", s.lower())
+    if m:
+        return f"P{m.group(1)}"
+
+    return s
+
+
 def make_chart(airport, obs_df, model_df, forecast_df):
     obs_hist = get_obs(airport, obs_df)
     today_obs = get_today_obs(airport, obs_df)
@@ -216,24 +279,43 @@ def make_chart(airport, obs_df, model_df, forecast_df):
             )
         )
 
-    if not model_hist.empty:
-        for _, row in model_hist.iterrows():
-            y = safe_float(row.get("modelled_max_abs"))
-            if y is None:
-                continue
-            fig.add_trace(
-                go.Scatter(
-                    x=[0, 24],
-                    y=[y, y],
-                    mode="lines",
-                    name="Modelled max",
-                    line=dict(color="#2563eb", width=2),
-                    showlegend=False,
+    if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
+        model_plot = model_hist.dropna(subset=["modelled_max_abs"]).copy()
+
+        if not model_plot.empty:
+            if len(model_plot) > 1:
+                prior_models = model_plot.iloc[:-1]
+                for i, (_, row) in enumerate(prior_models.iterrows()):
+                    y = safe_float(row.get("modelled_max_abs"))
+                    if y is None:
+                        continue
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[0, 24],
+                            y=[y, y],
+                            mode="lines",
+                            name="Prior modelled max" if i == 0 else None,
+                            line=dict(color="rgba(37,99,235,0.28)", width=2, dash="dot"),
+                            showlegend=(i == 0),
+                        )
+                    )
+
+            latest_row = model_plot.iloc[-1]
+            latest_y = safe_float(latest_row.get("modelled_max_abs"))
+            if latest_y is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[0, 24],
+                        y=[latest_y, latest_y],
+                        mode="lines",
+                        name="Modelled max",
+                        line=dict(color="#2563eb", width=2),
+                        showlegend=True,
+                    )
                 )
-            )
 
     if not latest_fc.empty:
-        y = safe_float(latest_fc["forecast_avg_max"].iloc[0])
+        y = safe_float(latest_fc["forecast_avg_max"].iloc[0]) if "forecast_avg_max" in latest_fc.columns else None
         if y is not None:
             fig.add_trace(
                 go.Scatter(
@@ -241,7 +323,23 @@ def make_chart(airport, obs_df, model_df, forecast_df):
                     y=[y, y],
                     mode="lines",
                     name="Forecast avg max",
-                    line=dict(color="red", width=4),
+                    line=dict(color="green", width=2),
+                )
+            )
+
+        qcols = get_forecast_quantile_columns(latest_fc)
+        for qcol in qcols:
+            qy = safe_float(latest_fc[qcol].iloc[0])
+            if qy is None:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=[0, 24],
+                    y=[qy, qy],
+                    mode="lines",
+                    name=pretty_quantile_name(qcol),
+                    line=dict(color="rgba(168,85,247,0.45)", width=1.5),
+                    showlegend=True,
                 )
             )
 
@@ -294,6 +392,7 @@ def airport_stats(airport, obs_df, model_df, forecast_df):
 
     fc_avg = fc1 = fc2 = fc3 = None
     fc_updated = None
+    quantiles = []
 
     if not latest_fc.empty:
         row = latest_fc.iloc[0]
@@ -303,6 +402,11 @@ def airport_stats(airport, obs_df, model_df, forecast_df):
         fc3 = safe_float(row.get("forecast_source_3"))
         fc_updated = row.get("pulled_at_local")
 
+        for qcol in get_forecast_quantile_columns(latest_fc):
+            qval = safe_float(row.get(qcol))
+            if qval is not None:
+                quantiles.append((pretty_quantile_name(qcol), qval))
+
     return {
         "current_temp": current_temp,
         "model_now": model_now,
@@ -310,6 +414,7 @@ def airport_stats(airport, obs_df, model_df, forecast_df):
         "fc1": fc1,
         "fc2": fc2,
         "fc3": fc3,
+        "quantiles": quantiles,
         "obs_updated": obs_updated,
         "model_updated": model_updated,
         "fc_updated": fc_updated,
@@ -361,13 +466,18 @@ for airport in airports:
 
         st.markdown("")
 
-        st.markdown(
-            f"**Forecast max**  \n"
-            f"Avg: {fmt_c(s['fc_avg'])} | {fmt_f(s['fc_avg'])}  \n"
-            f"S1: {fmt_c(s['fc1'])} | {fmt_f(s['fc1'])}  \n"
-            f"S2: {fmt_c(s['fc2'])} | {fmt_f(s['fc2'])}  \n"
-            f"S3: {fmt_c(s['fc3'])} | {fmt_f(s['fc3'])}"
-        )
+        forecast_lines = [
+            f"**Forecast max**  ",
+            f"Avg: {fmt_c(s['fc_avg'])} | {fmt_f(s['fc_avg'])}",
+            f"S1: {fmt_c(s['fc1'])} | {fmt_f(s['fc1'])}",
+            f"S2: {fmt_c(s['fc2'])} | {fmt_f(s['fc2'])}",
+            f"S3: {fmt_c(s['fc3'])} | {fmt_f(s['fc3'])}",
+        ]
+
+        for qname, qval in s["quantiles"]:
+            forecast_lines.append(f"{qname}: {fmt_c(qval)} | {fmt_f(qval)}")
+
+        st.markdown("  \n".join(forecast_lines))
 
         st.markdown("")
 
