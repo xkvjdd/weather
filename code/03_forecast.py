@@ -1,5 +1,4 @@
 import os
-import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -56,53 +55,32 @@ def today_local_str(tz_name: str) -> str:
     return datetime.now(ZoneInfo(tz_name)).date().isoformat()
 
 
-def f_to_c(x: float) -> float:
-    return (x - 32.0) * 5.0 / 9.0
-
-
 def clean_temp_to_celsius(value, unit: str | None = None) -> float | None:
     if value is None:
         return None
-
     try:
         x = float(value)
     except Exception:
         return None
-
     u = (unit or "C").upper()
     if u == "F":
-        return round(f_to_c(x), 3)
+        return round((x - 32.0) * 5.0 / 9.0, 3)
     return round(x, 3)
 
 
-def parse_high_from_wunderground_html(html: str) -> float | None:
-    if not html:
+def mean_ignore_none(values: list[float | None]) -> float | None:
+    xs = [float(v) for v in values if v is not None]
+    if not xs:
         return None
-
-    patterns = [
-        r"High\s+(-?\d+(?:\.\d+)?)\s*°?\s*([CF])",
-        r"High\s+(-?\d+(?:\.\d+)?)\s*([CF])",
-        r"High\s+(-?\d+(?:\.\d+)?)\b",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, html, flags=re.IGNORECASE)
-        if not m:
-            continue
-
-        value = m.group(1)
-        unit = m.group(2) if len(m.groups()) >= 2 else "F"
-        return clean_temp_to_celsius(value, unit)
-
-    return None
+    result = round(sum(xs) / len(xs), 3)
+    if len(xs) > 1 and (max(xs) - min(xs)) > 3.0:
+        print(f"    WARNING: Source spread > 3°C: {xs}")
+    return result
 
 
-def fetch_wunderground_forecast_max(session: requests.Session, icao: str) -> float | None:
-    url = f"https://www.wunderground.com/hourly/{icao}"
-    r = session.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return parse_high_from_wunderground_html(r.text)
-
+# ---------------------------------------------------------------------------
+# Source 1: Open-Meteo best-match daily max — today only
+# ---------------------------------------------------------------------------
 
 def fetch_open_meteo_daily_max(
     session: requests.Session,
@@ -111,11 +89,13 @@ def fetch_open_meteo_daily_max(
     tz_name: str,
 ) -> float | None:
     url = "https://api.open-meteo.com/v1/forecast"
+    today = today_local_str(tz_name)
     params = {
         "latitude": lat,
         "longitude": lon,
         "daily": "temperature_2m_max",
-        "forecast_days": 2,
+        "start_date": today,
+        "end_date": today,
         "timezone": tz_name,
         "temperature_unit": "celsius",
     }
@@ -124,20 +104,20 @@ def fetch_open_meteo_daily_max(
     r.raise_for_status()
     data = r.json()
 
-    daily = data.get("daily", {})
-    dates = daily.get("time", [])
-    vals = daily.get("temperature_2m_max", [])
+    dates = data.get("daily", {}).get("time", [])
+    vals = data.get("daily", {}).get("temperature_2m_max", [])
 
-    if not dates or not vals:
-        return None
-
-    target_day = today_local_str(tz_name)
     for d, v in zip(dates, vals):
-        if d == target_day:
+        if d == today and v is not None:
             return clean_temp_to_celsius(v, "C")
 
-    return clean_temp_to_celsius(vals[0], "C")
+    print(f"    WARNING: open-meteo daily — no match for {today}, got dates: {dates}")
+    return None
 
+
+# ---------------------------------------------------------------------------
+# Source 2: Open-Meteo GFS hourly max — today only, strict date filter
+# ---------------------------------------------------------------------------
 
 def fetch_open_meteo_gfs_hourly_max(
     session: requests.Session,
@@ -146,11 +126,13 @@ def fetch_open_meteo_gfs_hourly_max(
     tz_name: str,
 ) -> float | None:
     url = "https://api.open-meteo.com/v1/gfs"
+    today = today_local_str(tz_name)
     params = {
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m",
-        "forecast_days": 2,
+        "start_date": today,
+        "end_date": today,
         "timezone": tz_name,
         "temperature_unit": "celsius",
     }
@@ -159,48 +141,71 @@ def fetch_open_meteo_gfs_hourly_max(
     r.raise_for_status()
     data = r.json()
 
-    hourly = data.get("hourly", {})
-    times = hourly.get("time", [])
-    temps = hourly.get("temperature_2m", [])
-
-    if not times or not temps:
-        return None
-
-    target_day = today_local_str(tz_name)
+    times = data.get("hourly", {}).get("time", [])
+    temps = data.get("hourly", {}).get("temperature_2m", [])
 
     xs = []
     for t, temp in zip(times, temps):
-        try:
-            d = str(t)[:10]
-        except Exception:
-            continue
-        if d == target_day:
-            y = clean_temp_to_celsius(temp, "C")
-            if y is not None:
-                xs.append(y)
+        if str(t)[:10] == today and temp is not None:
+            v = clean_temp_to_celsius(temp, "C")
+            if v is not None:
+                xs.append(v)
 
     if xs:
         return round(max(xs), 3)
 
-    ys = [clean_temp_to_celsius(v, "C") for v in temps]
-    ys = [v for v in ys if v is not None]
-    if not ys:
-        return None
-    return round(max(ys), 3)
+    print(f"    WARNING: GFS hourly — no hours matched {today}, available: {sorted(set(str(t)[:10] for t in times))}")
+    return None
 
 
-def mean_ignore_none(values: list[float | None]) -> float | None:
-    xs = [float(v) for v in values if v is not None]
-    if not xs:
-        return None
-    return round(sum(xs) / len(xs), 3)
+# ---------------------------------------------------------------------------
+# Source 3: Open-Meteo historical/analysis max — today only
+# This uses the historical forecast API which returns analysed values for
+# today rather than a forward forecast, giving a grounded observed-ish high.
+# ---------------------------------------------------------------------------
 
+def fetch_open_meteo_historical_max(
+    session: requests.Session,
+    lat: float,
+    lon: float,
+    tz_name: str,
+) -> float | None:
+    url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+    today = today_local_str(tz_name)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": today,
+        "end_date": today,
+        "daily": "temperature_2m_max",
+        "timezone": tz_name,
+        "temperature_unit": "celsius",
+    }
+
+    r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    dates = data.get("daily", {}).get("time", [])
+    vals = data.get("daily", {}).get("temperature_2m_max", [])
+
+    for d, v in zip(dates, vals):
+        if d == today and v is not None:
+            return clean_temp_to_celsius(v, "C")
+
+    print(f"    WARNING: historical forecast API — no match for {today}, got dates: {dates}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Per-airport fetch
+# ---------------------------------------------------------------------------
 
 def fetch_airport_forecasts(session: requests.Session, airport: str, meta: dict) -> dict:
-    icao = meta["icao"]
     lat = meta["lat"]
     lon = meta["lon"]
     tz_name = meta["tz"]
+    icao = meta["icao"]
 
     pulled_at_local = now_local_naive(tz_name)
     forecast_date_local = today_local_str(tz_name)
@@ -208,19 +213,19 @@ def fetch_airport_forecasts(session: requests.Session, airport: str, meta: dict)
     src1 = src2 = src3 = None
 
     try:
-        src1 = fetch_wunderground_forecast_max(session, icao)
+        src1 = fetch_open_meteo_daily_max(session, lat, lon, tz_name)
     except Exception as e:
-        print(f"  S1 Wunderground FAILED: {e}")
+        print(f"  S1 open-meteo daily FAILED: {e}")
 
     try:
-        src2 = fetch_open_meteo_daily_max(session, lat, lon, tz_name)
+        src2 = fetch_open_meteo_gfs_hourly_max(session, lat, lon, tz_name)
     except Exception as e:
-        print(f"  S2 Open-Meteo FAILED: {e}")
+        print(f"  S2 GFS hourly FAILED: {e}")
 
     try:
-        src3 = fetch_open_meteo_gfs_hourly_max(session, lat, lon, tz_name)
+        src3 = fetch_open_meteo_historical_max(session, lat, lon, tz_name)
     except Exception as e:
-        print(f"  S3 GFS FAILED: {e}")
+        print(f"  S3 historical forecast FAILED: {e}")
 
     avg_val = mean_ignore_none([src1, src2, src3])
 
@@ -233,49 +238,28 @@ def fetch_airport_forecasts(session: requests.Session, airport: str, meta: dict)
         "forecast_source_2": src2,
         "forecast_source_3": src3,
         "forecast_avg_max": avg_val,
-        "source_1_name": "wunderground_hourly_high",
-        "source_2_name": "open_meteo_best_match_daily_max",
-        "source_3_name": "open_meteo_gfs_hourly_day_max",
+        "source_1_name": "open_meteo_best_match_daily_max",
+        "source_2_name": "open_meteo_gfs_hourly_day_max",
+        "source_3_name": "open_meteo_historical_forecast_daily_max",
     }
 
 
+# ---------------------------------------------------------------------------
+# Storage helpers
+# ---------------------------------------------------------------------------
+
 def load_existing(path: str) -> pd.DataFrame:
+    cols = [
+        "airport", "icao", "forecast_date_local", "pulled_at_local",
+        "forecast_source_1", "forecast_source_2", "forecast_source_3",
+        "forecast_avg_max", "source_1_name", "source_2_name", "source_3_name",
+    ]
     if os.path.exists(path):
         df = pd.read_parquet(path)
-        keep = [
-            c for c in [
-                "airport",
-                "icao",
-                "forecast_date_local",
-                "pulled_at_local",
-                "forecast_source_1",
-                "forecast_source_2",
-                "forecast_source_3",
-                "forecast_avg_max",
-                "source_1_name",
-                "source_2_name",
-                "source_3_name",
-            ]
-            if c in df.columns
-        ]
+        keep = [c for c in cols if c in df.columns]
         if keep:
             return df[keep].copy()
-
-    return pd.DataFrame(
-        columns=[
-            "airport",
-            "icao",
-            "forecast_date_local",
-            "pulled_at_local",
-            "forecast_source_1",
-            "forecast_source_2",
-            "forecast_source_3",
-            "forecast_avg_max",
-            "source_1_name",
-            "source_2_name",
-            "source_3_name",
-        ]
-    )
+    return pd.DataFrame(columns=cols)
 
 
 def main() -> None:
@@ -283,13 +267,12 @@ def main() -> None:
     rows = []
 
     for airport, meta in AIRPORTS.items():
-        print(f"Fetching forecast for {airport} ({meta['icao']})")
+        print(f"Fetching forecast for {airport} ({meta['icao']}) — local date: {today_local_str(meta['tz'])}")
         try:
             row = fetch_airport_forecasts(session, airport, meta)
             rows.append(row)
             print(
-                "  "
-                f"S1={row['forecast_source_1']} "
+                f"  S1={row['forecast_source_1']} "
                 f"S2={row['forecast_source_2']} "
                 f"S3={row['forecast_source_3']} "
                 f"AVG={row['forecast_avg_max']}"
@@ -305,16 +288,10 @@ def main() -> None:
 
     new_df = pd.DataFrame(rows)
     existing = load_existing(OUTPUT_PATH)
-
     combined = pd.concat([existing, new_df], ignore_index=True)
 
     combined["pulled_at_local"] = pd.to_datetime(combined["pulled_at_local"], errors="coerce")
-    for col in [
-        "forecast_source_1",
-        "forecast_source_2",
-        "forecast_source_3",
-        "forecast_avg_max",
-    ]:
+    for col in ["forecast_source_1", "forecast_source_2", "forecast_source_3", "forecast_avg_max"]:
         combined[col] = pd.to_numeric(combined[col], errors="coerce")
 
     combined = combined.dropna(subset=["airport", "pulled_at_local"]).copy()
