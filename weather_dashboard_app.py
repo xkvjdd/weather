@@ -45,7 +45,7 @@ def safe_float(x):
         if pd.isna(v):
             return None
         return v
-    except:
+    except Exception:
         return None
 
 
@@ -54,13 +54,6 @@ def c_to_f(x):
     if x is None:
         return None
     return x * 9 / 5 + 32
-
-
-def delta_c_to_f(x):
-    x = safe_float(x)
-    if x is None:
-        return None
-    return x * 9 / 5
 
 
 def fmt_c(x):
@@ -77,26 +70,12 @@ def fmt_f(x):
     return f"{x:.1f}°F"
 
 
-def fmt_delta_c(x):
-    x = safe_float(x)
-    if x is None:
-        return "—"
-    return f"{x:+.1f}°C"
-
-
-def fmt_delta_f(x):
-    x = delta_c_to_f(x)
-    if x is None:
-        return "—"
-    return f"{x:+.1f}°F"
-
-
 def fmt_ts(x):
     if pd.isna(x):
         return "—"
     try:
         return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
-    except:
+    except Exception:
         return str(x)
 
 
@@ -105,7 +84,7 @@ def rank_airports(rank_df, obs_df):
         tmp = rank_df.copy().sort_values(["mae", "airport"])
         return tmp["airport"].dropna().astype(str).tolist()
     if not obs_df.empty and "airport" in obs_df.columns:
-        return sorted(obs_df["airport"].dropna().unique())
+        return sorted(obs_df["airport"].dropna().astype(str).unique().tolist())
     return []
 
 
@@ -170,15 +149,18 @@ def add_model_absolute_max(model_hist, obs_hist):
         x["modelled_max_abs"] = pd.NA
         return x
 
-    if obs_hist.empty:
+    x["projected_max_temp"] = pd.to_numeric(x["projected_max_temp"], errors="coerce")
+
+    if obs_hist.empty or "temp" not in obs_hist.columns:
         x["modelled_max_abs"] = x["projected_max_temp"]
         return x
 
     obs = obs_hist[["timestamp_local", "temp"]].copy()
     obs["timestamp_local"] = pd.to_datetime(obs["timestamp_local"], errors="coerce")
-    obs = obs.dropna().sort_values("timestamp_local")
+    obs["temp"] = pd.to_numeric(obs["temp"], errors="coerce")
+    obs = obs.dropna(subset=["timestamp_local"]).sort_values("timestamp_local")
 
-    mdl = x.sort_values("run_timestamp_local")
+    mdl = x.sort_values("run_timestamp_local").copy()
 
     merged = pd.merge_asof(
         mdl,
@@ -189,8 +171,8 @@ def add_model_absolute_max(model_hist, obs_hist):
         tolerance=pd.Timedelta("2H"),
     )
 
+    merged["temp_at_run"] = pd.to_numeric(merged["temp_at_run"], errors="coerce")
     merged["modelled_max_abs"] = merged["temp_at_run"] + merged["projected_max_temp"]
-
     merged["modelled_max_abs"] = merged["modelled_max_abs"].where(
         merged["modelled_max_abs"].notna(),
         merged["projected_max_temp"],
@@ -290,9 +272,10 @@ def make_chart(airport, obs_df, model_df, forecast_df):
 
 
 def airport_stats(airport, obs_df, model_df, forecast_df):
-
+    obs_hist = get_obs(airport, obs_df)
     today_obs = get_today_obs(airport, obs_df)
-    model_hist = get_model_hist(airport, model_df)
+    model_hist_raw = get_model_hist(airport, model_df)
+    model_hist = add_model_absolute_max(model_hist_raw, obs_hist)
     latest_fc = get_latest_forecast(airport, forecast_df)
 
     current_temp = None
@@ -304,31 +287,25 @@ def airport_stats(airport, obs_df, model_df, forecast_df):
         obs_updated = row["timestamp_local"]
 
     model_now = None
-    model_prev = None
     model_updated = None
-
-    if not model_hist.empty:
-        model_now = safe_float(model_hist["projected_max_temp"].iloc[-1])
+    if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
+        model_now = safe_float(model_hist["modelled_max_abs"].iloc[-1])
         model_updated = model_hist["run_timestamp_local"].iloc[-1]
-        if len(model_hist) >= 2:
-            model_prev = safe_float(model_hist["projected_max_temp"].iloc[-2])
 
     fc_avg = fc1 = fc2 = fc3 = None
     fc_updated = None
-    fc_prev = None
 
     if not latest_fc.empty:
         row = latest_fc.iloc[0]
-        fc_avg = safe_float(row["forecast_avg_max"])
-        fc1 = safe_float(row["forecast_source_1"])
-        fc2 = safe_float(row["forecast_source_2"])
-        fc3 = safe_float(row["forecast_source_3"])
-        fc_updated = row["pulled_at_local"]
+        fc_avg = safe_float(row.get("forecast_avg_max"))
+        fc1 = safe_float(row.get("forecast_source_1"))
+        fc2 = safe_float(row.get("forecast_source_2"))
+        fc3 = safe_float(row.get("forecast_source_3"))
+        fc_updated = row.get("pulled_at_local")
 
     return {
         "current_temp": current_temp,
         "model_now": model_now,
-        "model_delta": None if model_prev is None else model_now - model_prev,
         "fc_avg": fc_avg,
         "fc1": fc1,
         "fc2": fc2,
@@ -350,7 +327,6 @@ st.caption(f"Auto-refresh target: every {AUTO_REFRESH_SECONDS//60} minutes")
 airports = rank_airports(rank_df, obs_df)
 
 for airport in airports:
-
     st.markdown("---")
 
     chart_col, stat_col = st.columns([4.6, 1.4])
@@ -365,7 +341,6 @@ for airport in airports:
     airport_obs = get_obs(airport, obs_df)
 
     with stat_col:
-
         local_time = "—"
         if not airport_obs.empty:
             local_time = airport_obs["timestamp_local"].max().strftime("%Y-%m-%d %H:%M")
