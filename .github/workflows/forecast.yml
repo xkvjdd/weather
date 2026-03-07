@@ -1,7 +1,7 @@
 name: Build Forecast Latest
 on:
   schedule:
-    - cron: "8,18,28,38,48,58 * * * *"
+    - cron: "8,38 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
