@@ -1,50 +1,19 @@
-import re
 import json
-import time
-import html
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 from bs4 import BeautifulSoup
 
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
+# ============================================================
 
-AIRPORT_SEARCH = {
-    "ATL": "Hartsfield Jackson Atlanta International Airport",
-    "NYC": "LaGuardia Airport",
-    "CHI": "O'Hare International Airport",
-    "DAL": "Dallas Love Field",
-    "SEA": "Seattle Tacoma International Airport",
-    "MIA": "Miami International Airport",
-    "TOR": "Toronto Pearson International Airport",
-    "PAR": "Charles de Gaulle Airport",
-    "SEL": "Incheon International Airport",
-    "ANK": "Esenboga Airport",
-    "BUE": "Ezeiza International Airport",
-    "LON": "Heathrow Airport",
-    "WLG": "Wellington Airport",
-}
-
-AIRPORT_TZ = {
-    "ATL": "America/New_York",
-    "NYC": "America/New_York",
-    "CHI": "America/Chicago",
-    "DAL": "America/Chicago",
-    "SEA": "America/Los_Angeles",
-    "MIA": "America/New_York",
-    "TOR": "America/Toronto",
-    "PAR": "Europe/Paris",
-    "SEL": "Asia/Seoul",
-    "ANK": "Europe/Istanbul",
-    "BUE": "America/Argentina/Buenos_Aires",
-    "LON": "Europe/London",
-    "WLG": "Pacific/Auckland",
-}
+MAX_WORKERS = 16
+TIMEOUT = 12
 
 HEADERS = {
     "User-Agent": (
@@ -55,465 +24,354 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-DDG_HTML = "https://html.duckduckgo.com/html/"
+AIRPORT_META = {
+    "ATL": {"name": "Hartsfield Jackson Atlanta International Airport", "tz": "America/New_York"},
+    "NYC": {"name": "LaGuardia Airport", "tz": "America/New_York"},
+    "CHI": {"name": "O'Hare International Airport", "tz": "America/Chicago"},
+    "DAL": {"name": "Dallas Love Field", "tz": "America/Chicago"},
+    "SEA": {"name": "Seattle Tacoma International Airport", "tz": "America/Los_Angeles"},
+    "MIA": {"name": "Miami International Airport", "tz": "America/New_York"},
+    "TOR": {"name": "Toronto Pearson International Airport", "tz": "America/Toronto"},
+    "PAR": {"name": "Charles de Gaulle Airport", "tz": "Europe/Paris"},
+    "SEL": {"name": "Incheon International Airport", "tz": "Asia/Seoul"},
+    "ANK": {"name": "Esenboga Airport", "tz": "Europe/Istanbul"},
+    "BUE": {"name": "Ezeiza International Airport", "tz": "America/Argentina/Buenos_Aires"},
+    "LON": {"name": "Heathrow Airport", "tz": "Europe/London"},
+    "WLG": {"name": "Wellington Airport", "tz": "Pacific/Auckland"},
+}
+
+# Fill these with your exact final working URLs.
+# S1 = AccuWeather
+# S2 = BBC
+# S3 = Weather.com
+AIRPORT_LINKS = {
+    "ATL": {
+        "S1": "https://www.accuweather.com/en/us/atlanta/30303/weather-forecast/348181",
+        "S2": "",
+        "S3": "https://weather.com/weather/tenday/l/9ec68ae9b6bf94371f1eab8b71aa9a0a83d7cb663bfaacc25cbaa51622e102c3",
+    },
+    "NYC": {"S1": "", "S2": "", "S3": ""},
+    "CHI": {"S1": "", "S2": "", "S3": ""},
+    "DAL": {"S1": "", "S2": "", "S3": ""},
+    "SEA": {"S1": "", "S2": "", "S3": ""},
+    "MIA": {"S1": "", "S2": "", "S3": ""},
+    "TOR": {"S1": "", "S2": "", "S3": ""},
+    "PAR": {"S1": "", "S2": "", "S3": ""},
+    "SEL": {"S1": "", "S2": "", "S3": ""},
+    "ANK": {"S1": "", "S2": "", "S3": ""},
+    "BUE": {"S1": "", "S2": "", "S3": ""},
+    "LON": {"S1": "", "S2": "", "S3": ""},
+    "WLG": {"S1": "", "S2": "", "S3": ""},
+}
 
 
-# =========================
+# ============================================================
 # HELPERS
-# =========================
+# ============================================================
 
-def local_now(code: str) -> datetime:
-    return datetime.now(ZoneInfo(AIRPORT_TZ[code]))
-
-
-def clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def get(url: str, timeout: int = 25) -> requests.Response:
-    r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r
+def now_local(code: str) -> datetime:
+    return datetime.now(ZoneInfo(AIRPORT_META[code]["tz"]))
 
 
-def resolve_final_url(url: str) -> str:
-    try:
-        return get(url, timeout=25).url
-    except Exception:
-        return url
+def c_to_f(c: float) -> float:
+    return round(c * 9 / 5 + 32, 1)
 
 
-def ddg_search(query: str, pause: float = 1.0):
-    time.sleep(pause)
-    r = requests.post(
-        DDG_HTML,
-        headers=HEADERS,
-        data={"q": query},
-        timeout=30,
-    )
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    results = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href", "").strip()
-        title = clean_text(a.get_text(" ", strip=True))
-        if not href:
-            continue
-
-        # DuckDuckGo sometimes wraps the target URL inside uddg=
-        parsed = urlparse(href)
-        qs = parse_qs(parsed.query)
-        if "uddg" in qs:
-            target = unquote(qs["uddg"][0])
-        else:
-            target = href
-
-        results.append({
-            "title": title,
-            "url": target,
-        })
-    return results
-
-
-def pick_best_url(candidates, rules):
-    """
-    rules = [
-        lambda url,title: score,
-        ...
-    ]
-    """
-    scored = []
-    for c in candidates:
-        url = c["url"]
-        title = c["title"]
-        score = 0
-        for fn in rules:
-            try:
-                score += fn(url, title)
-            except Exception:
-                pass
-        scored.append((score, c))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]["url"] if scored and scored[0][0] > 0 else None
-
-
-def maybe_force_accuweather_daily(url: str) -> str:
-    if not url:
-        return url
-    if "accuweather.com" not in url:
-        return url
-    url = url.split("?")[0]
-    if "/daily-weather-forecast/" in url:
-        return url
-    if "/weather-forecast/" in url:
-        return url.replace("/weather-forecast/", "/daily-weather-forecast/")
-    return url
-
-
-def extract_json_scripts(html_text: str):
-    soup = BeautifulSoup(html_text, "html.parser")
-    blocks = []
-    for s in soup.find_all("script"):
-        txt = s.string or s.get_text()
-        if txt:
-            blocks.append(txt)
-    return blocks
-
-
-def first_int(s):
-    m = re.search(r"-?\d+", s)
-    return int(m.group()) if m else None
-
-
-def f_to_c(f):
+def f_to_c(f: float) -> float:
     return round((f - 32) * 5 / 9, 1)
 
 
-# =========================
-# LINK DISCOVERY
-# =========================
+def first_int(text: str):
+    if text is None:
+        return None
+    m = re.search(r"-?\d+", text)
+    return int(m.group()) if m else None
 
-def discover_accuweather_url(code: str, airport_name: str) -> str | None:
-    queries = [
-        f'site:accuweather.com "{airport_name}" "daily-weather-forecast"',
-        f'site:accuweather.com "{airport_name}" "weather-forecast"',
-        f'site:accuweather.com "{airport_name}" AccuWeather',
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=1)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+def fetch_text(session: requests.Session, url: str) -> tuple[str | None, str | None]:
+    if not url:
+        return None, "blank_url"
+    try:
+        r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        r.raise_for_status()
+        return r.text, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+# ============================================================
+# S1 ACCUWEATHER PARSER
+# Based on your first screenshot:
+# a.daily-list-item -> div.temp -> span.temp-hi
+# ============================================================
+
+def parse_accuweather_today_high(code: str, html: str):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Best case: first daily list item marked TODAY row
+    items = soup.select("a.daily-list-item")
+    for item in items:
+        row_text = clean_text(item.get_text(" ", strip=True)).lower()
+
+        hi = item.select_one("div.temp span.temp-hi")
+        if hi:
+            hi_val = first_int(hi.get_text(" ", strip=True))
+            if hi_val is not None:
+                # Prefer row that clearly says Today first
+                if "today" in row_text:
+                    return {
+                        "temp_c": hi_val,
+                        "temp_f": c_to_f(hi_val),
+                        "method": "accuweather_daily_list_today",
+                    }
+
+    # Fallback: first daily-list-item high
+    for item in items:
+        hi = item.select_one("div.temp span.temp-hi")
+        if hi:
+            hi_val = first_int(hi.get_text(" ", strip=True))
+            if hi_val is not None:
+                return {
+                    "temp_c": hi_val,
+                    "temp_f": c_to_f(hi_val),
+                    "method": "accuweather_daily_list_first",
+                }
+
+    # Fallback regex on raw HTML
+    raw_patterns = [
+        r'<span class="temp-hi">(-?\d+)<',
+        r'"temp-hi"[^>]*>\s*(-?\d+)\s*<',
+        r'\bToday\b.{0,250}?(-?\d+)\s*[°º]',
+    ]
+    for i, patt in enumerate(raw_patterns, start=1):
+        m = re.search(patt, html, flags=re.I | re.S)
+        if m:
+            c = int(m.group(1))
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": f"accuweather_regex_{i}",
+            }
+
+    return None
+
+
+# ============================================================
+# S2 BBC PARSER
+# Leave as-is
+# ============================================================
+
+def parse_bbc_today_high(code: str, html: str):
+    text = clean_text(html)
+    dt = now_local(code)
+    weekday_full = dt.strftime("%A")
+    day_num = str(dt.day)
+
+    patterns = [
+        r'"maxTempC"\s*:\s*(-?\d+)',
+        r'"maximumTemperature"\s*:\s*(-?\d+)',
+        rf"\b{weekday_full}\b.*?\b{day_num}\b.*?\bHigh\b.*?(-?\d+)\s*[°º]C",
+        r"\bHigh\b.*?(-?\d+)\s*[°º]C",
     ]
 
-    candidates = []
-    for q in queries:
-        try:
-            candidates.extend(ddg_search(q))
-        except Exception:
-            pass
+    for i, patt in enumerate(patterns, start=1):
+        m = re.search(patt, html if i <= 2 else text, flags=re.I | re.S)
+        if m:
+            c = int(m.group(1))
+            return {
+                "temp_c": c,
+                "temp_f": c_to_f(c),
+                "method": f"bbc_p{i}",
+            }
 
-    def rule(url, title):
-        s = 0
-        u = url.lower()
-        t = title.lower()
-        name = airport_name.lower()
-
-        if "accuweather.com" in u:
-            s += 100
-        if "/daily-weather-forecast/" in u:
-            s += 60
-        if "/weather-forecast/" in u:
-            s += 30
-        if "airport" in u or "airport" in t:
-            s += 15
-        for token in re.split(r"[^a-z0-9]+", name):
-            if token and token in u:
-                s += 2
-            if token and token in t:
-                s += 2
-        return s
-
-    url = pick_best_url(candidates, [rule])
-    if url:
-        url = maybe_force_accuweather_daily(url)
-        url = resolve_final_url(url)
-        url = maybe_force_accuweather_daily(url)
-    return url
+    return None
 
 
-def discover_weathercom_url(code: str, airport_name: str) -> str | None:
-    queries = [
-        f'site:weather.com/weather/tenday "{airport_name}"',
-        f'site:weather.com "{airport_name}" "weather/tenday"',
-        f'site:weather.com "{airport_name}" weather.com forecast',
+# ============================================================
+# S3 WEATHER.COM PARSER
+# Based on your second screenshot:
+# div[data-testid="DailyContent"]
+# span[data-testid="TemperatureValue"]
+# ============================================================
+
+def parse_weathercom_today_high(code: str, html: str):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Best case: first expanded DailyContent / Today block
+    daily_blocks = soup.select('div[data-testid="DailyContent"]')
+    for idx, block in enumerate(daily_blocks):
+        temp_span = block.select_one('span[data-testid="TemperatureValue"]')
+        if temp_span:
+            temp_f = first_int(temp_span.get_text(" ", strip=True))
+            if temp_f is not None:
+                return {
+                    "temp_c": f_to_c(temp_f),
+                    "temp_f": temp_f,
+                    "method": f"weathercom_dailycontent_{idx}",
+                }
+
+    # Next fallback: disclosure summary area
+    summaries = soup.select('summary[data-testid="Disclosure-Summary"]')
+    for idx, summ in enumerate(summaries):
+        temp_span = summ.select_one('span[data-testid="TemperatureValue"]')
+        if temp_span:
+            temp_f = first_int(temp_span.get_text(" ", strip=True))
+            if temp_f is not None:
+                return {
+                    "temp_c": f_to_c(temp_f),
+                    "temp_f": temp_f,
+                    "method": f"weathercom_summary_{idx}",
+                }
+
+    # Raw regex fallback from HTML
+    raw_patterns = [
+        r'data-testid="TemperatureValue"[^>]*>\s*(-?\d+)\s*°?',
+        r'"temperature":\s*(-?\d+)',
+        r'\bToday\b.{0,250}?(-?\d+)\s*°',
     ]
+    for i, patt in enumerate(raw_patterns, start=1):
+        m = re.search(patt, html, flags=re.I | re.S)
+        if m:
+            f = int(m.group(1))
+            return {
+                "temp_c": f_to_c(f),
+                "temp_f": f,
+                "method": f"weathercom_regex_{i}",
+            }
 
-    candidates = []
-    for q in queries:
-        try:
-            candidates.extend(ddg_search(q))
-        except Exception:
-            pass
-
-    def rule(url, title):
-        s = 0
-        u = url.lower()
-        t = title.lower()
-        name = airport_name.lower()
-
-        if "weather.com" in u:
-            s += 100
-        if "/weather/tenday/" in u:
-            s += 70
-        if "/weather/today/" in u:
-            s += 20
-        if "airport" in u or "airport" in t:
-            s += 10
-        # hashed location style
-        if re.search(r"/weather/tenday/l/[a-f0-9]{32,}", u):
-            s += 30
-        for token in re.split(r"[^a-z0-9]+", name):
-            if token and token in u:
-                s += 2
-            if token and token in t:
-                s += 2
-        return s
-
-    url = pick_best_url(candidates, [rule])
-    if url:
-        url = resolve_final_url(url)
-    return url
+    return None
 
 
-def discover_bbc_url(code: str, airport_name: str) -> str | None:
-    queries = [
-        f'site:bbc.com/weather "{airport_name}"',
-        f'site:bbc.com/weather "{airport_name}" BBC Weather',
-        f'site:bbc.co.uk/weather "{airport_name}" BBC Weather',
-    ]
-
-    candidates = []
-    for q in queries:
-        try:
-            candidates.extend(ddg_search(q))
-        except Exception:
-            pass
-
-    def rule(url, title):
-        s = 0
-        u = url.lower()
-        t = title.lower()
-        name = airport_name.lower()
-
-        if "bbc.com/weather" in u or "bbc.co.uk/weather" in u:
-            s += 100
-        if "forecast" in u:
-            s += 20
-        if "airport" in u or "airport" in t:
-            s += 10
-        for token in re.split(r"[^a-z0-9]+", name):
-            if token and token in u:
-                s += 2
-            if token and token in t:
-                s += 2
-        return s
-
-    url = pick_best_url(candidates, [rule])
-    if url:
-        url = resolve_final_url(url)
-    return url
+def parse_source(code: str, source: str, html: str):
+    if source == "S1":
+        return parse_accuweather_today_high(code, html)
+    if source == "S2":
+        return parse_bbc_today_high(code, html)
+    if source == "S3":
+        return parse_weathercom_today_high(code, html)
+    return None
 
 
-# =========================
-# TEMP EXTRACTION
-# =========================
+# ============================================================
+# WORKERS
+# ============================================================
 
-def extract_accuweather_today_high(code: str, url: str):
-    """
-    Best-effort parser for AccuWeather daily page.
-    Returns dict:
-      {"temp_c": ..., "temp_f": ..., "method": "..."}
-    """
-    try:
-        r = get(url, timeout=30)
-        text = clean_text(BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True))
+def fetch_one(session: requests.Session, code: str, source: str, url: str):
+    html, err = fetch_text(session, url)
+    if err:
+        return {
+            "code": code,
+            "source": source,
+            "url": url,
+            "ok": False,
+            "error": err,
+            "temp_c": None,
+            "temp_f": None,
+            "method": None,
+        }
 
-        now = local_now(code)
-        weekday_short = now.strftime("%a")       # Sat
-        m = now.month
-        d = now.day
+    parsed = parse_source(code, source, html)
+    if not parsed:
+        return {
+            "code": code,
+            "source": source,
+            "url": url,
+            "ok": False,
+            "error": "parse_failed",
+            "temp_c": None,
+            "temp_f": None,
+            "method": None,
+        }
 
-        # Pattern seen in accessible page text:
-        # "Sat 3/7 27° /18° ..."
-        patt1 = rf"\b{weekday_short}\s+{m}/{d}\s+(-?\d+)\s*[°º]\s*/\s*-?\d+\s*[°º]"
-        m1 = re.search(patt1, text)
-        if m1:
-            c = int(m1.group(1))
-            return {"temp_c": c, "temp_f": round(c * 9 / 5 + 32, 1), "method": "accuweather_day_row"}
-
-        # Fallback: "Today 3/7 27° 18° ..."
-        patt2 = rf"\bToday\s+{m}/{d}\s+(-?\d+)\s*[°º]"
-        m2 = re.search(patt2, text, flags=re.I)
-        if m2:
-            c = int(m2.group(1))
-            return {"temp_c": c, "temp_f": round(c * 9 / 5 + 32, 1), "method": "accuweather_today_label"}
-
-        # Fallback generic - first hi/lo pair on page
-        patt3 = r"\b(-?\d+)\s*[°º]\s*/\s*-?\d+\s*[°º]"
-        m3 = re.search(patt3, text)
-        if m3:
-            c = int(m3.group(1))
-            return {"temp_c": c, "temp_f": round(c * 9 / 5 + 32, 1), "method": "accuweather_first_pair"}
-
-        return None
-    except Exception:
-        return None
-
-
-def extract_weathercom_today_high(code: str, url: str):
-    """
-    Best-effort parser for Weather.com 10-day page.
-    Weather.com often displays in F by default.
-    """
-    try:
-        r = get(url, timeout=30)
-        text = clean_text(BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True))
-        now = local_now(code)
-        weekday_short = now.strftime("%a")  # Sat
-        day2 = now.strftime("%d")           # 07
-
-        # Pattern seen in accessible text:
-        # "Sat 07. 69° / 61° ..."
-        patt1 = rf"\b{weekday_short}\s+{day2}\.\s+(-?\d+)\s*[°º]\s*/\s*-?\d+\s*[°º]"
-        m1 = re.search(patt1, text)
-        if m1:
-            f = int(m1.group(1))
-            return {"temp_c": f_to_c(f), "temp_f": f, "method": "weathercom_day_row"}
-
-        # Sometimes "Today. -- / 59°" happens at night, so look for first proper day pair after current row
-        patt2 = r"\b(?:Today|Tonight)\.?\s+--\s*/\s*-?\d+\s*[°º].{0,200}?\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{2}\.\s+(-?\d+)\s*[°º]\s*/\s*-?\d+\s*[°º]"
-        m2 = re.search(patt2, text, flags=re.I)
-        if m2:
-            f = int(m2.group(1))
-            return {"temp_c": f_to_c(f), "temp_f": f, "method": "weathercom_after_tonight"}
-
-        # Fallback first day pair
-        patt3 = r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{2}\.\s+(-?\d+)\s*[°º]\s*/\s*-?\d+\s*[°º]"
-        m3 = re.search(patt3, text)
-        if m3:
-            f = int(m3.group(1))
-            return {"temp_c": f_to_c(f), "temp_f": f, "method": "weathercom_first_pair"}
-
-        return None
-    except Exception:
-        return None
-
-
-def extract_bbc_today_high(code: str, url: str):
-    """
-    BBC parser is more heuristic because page structure can vary.
-    We try:
-    1) embedded JSON/script text
-    2) raw visible text around today's local weekday/date
-    """
-    try:
-        r = get(url, timeout=30)
-        html_text = r.text
-        text = clean_text(BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True))
-        now = local_now(code)
-        weekday_full = now.strftime("%A")
-        day_num = str(now.day)
-
-        # Try embedded JSON snippets for max temp values
-        scripts = extract_json_scripts(html_text)
-        for block in scripts:
-            # general patterns that often appear in weather JSON
-            for patt in [
-                r'"maxTempC"\s*:\s*(-?\d+)',
-                r'"maximumTemperature"\s*:\s*(-?\d+)',
-                r'"temperatureMax"\s*:\s*(-?\d+)',
-            ]:
-                m = re.search(patt, block)
-                if m:
-                    c = int(m.group(1))
-                    return {"temp_c": c, "temp_f": round(c * 9 / 5 + 32, 1), "method": "bbc_script_json"}
-
-        # Visible text fallback
-        patt1 = rf"\b{weekday_full}\b.*?\b{day_num}\b.*?\bHigh\b.*?(-?\d+)\s*[°º]C"
-        m1 = re.search(patt1, text, flags=re.I)
-        if m1:
-            c = int(m1.group(1))
-            return {"temp_c": c, "temp_f": round(c * 9 / 5 + 32, 1), "method": "bbc_visible_high_c"}
-
-        patt2 = r"\bHigh\b.*?(-?\d+)\s*[°º]C"
-        m2 = re.search(patt2, text, flags=re.I)
-        if m2:
-            c = int(m2.group(1))
-            return {"temp_c": c, "temp_f": round(c * 9 / 5 + 32, 1), "method": "bbc_first_high_c"}
-
-        return None
-    except Exception:
-        return None
-
-
-# =========================
-# MAIN PIPELINE
-# =========================
-
-def process_airport(code: str, airport_name: str):
-    out = {
+    return {
         "code": code,
-        "airport": airport_name,
-        "local_now": local_now(code).strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "S1_accuweather_url": None,
-        "S2_bbc_url": None,
-        "S3_weathercom_url": None,
-        "S1_accuweather_today_high_c": None,
-        "S1_accuweather_today_high_f": None,
-        "S1_accuweather_method": None,
-        "S2_bbc_today_high_c": None,
-        "S2_bbc_today_high_f": None,
-        "S2_bbc_method": None,
-        "S3_weathercom_today_high_c": None,
-        "S3_weathercom_today_high_f": None,
-        "S3_weathercom_method": None,
-        "status": "ok",
+        "source": source,
+        "url": url,
+        "ok": True,
+        "error": None,
+        "temp_c": parsed["temp_c"],
+        "temp_f": parsed["temp_f"],
+        "method": parsed["method"],
     }
 
-    try:
-        # S1 AccuWeather
-        s1 = discover_accuweather_url(code, airport_name)
-        out["S1_accuweather_url"] = s1
-        if s1:
-            temp = extract_accuweather_today_high(code, s1)
-            if temp:
-                out["S1_accuweather_today_high_c"] = temp["temp_c"]
-                out["S1_accuweather_today_high_f"] = temp["temp_f"]
-                out["S1_accuweather_method"] = temp["method"]
 
-        # S2 BBC
-        s2 = discover_bbc_url(code, airport_name)
-        out["S2_bbc_url"] = s2
-        if s2:
-            temp = extract_bbc_today_high(code, s2)
-            if temp:
-                out["S2_bbc_today_high_c"] = temp["temp_c"]
-                out["S2_bbc_today_high_f"] = temp["temp_f"]
-                out["S2_bbc_method"] = temp["method"]
+def process_all():
+    results = {
+        code: {
+            "code": code,
+            "airport": AIRPORT_META[code]["name"],
+            "local_now": now_local(code).strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "S1_url": AIRPORT_LINKS[code]["S1"],
+            "S2_url": AIRPORT_LINKS[code]["S2"],
+            "S3_url": AIRPORT_LINKS[code]["S3"],
+            "S1_temp_c": None,
+            "S1_temp_f": None,
+            "S1_method": None,
+            "S1_error": None,
+            "S2_temp_c": None,
+            "S2_temp_f": None,
+            "S2_method": None,
+            "S2_error": None,
+            "S3_temp_c": None,
+            "S3_temp_f": None,
+            "S3_method": None,
+            "S3_error": None,
+        }
+        for code in AIRPORT_META
+    }
 
-        # S3 Weather.com
-        s3 = discover_weathercom_url(code, airport_name)
-        out["S3_weathercom_url"] = s3
-        if s3:
-            temp = extract_weathercom_today_high(code, s3)
-            if temp:
-                out["S3_weathercom_today_high_c"] = temp["temp_c"]
-                out["S3_weathercom_today_high_f"] = temp["temp_f"]
-                out["S3_weathercom_method"] = temp["method"]
+    jobs = []
+    with make_session() as session:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            for code, links in AIRPORT_LINKS.items():
+                for source in ("S1", "S2", "S3"):
+                    url = links.get(source, "")
+                    if url:
+                        jobs.append(ex.submit(fetch_one, session, code, source, url))
+                    else:
+                        results[code][f"{source}_error"] = "blank_url"
 
-    except Exception as e:
-        out["status"] = f"error: {type(e).__name__}: {e}"
+            for fut in as_completed(jobs):
+                row = fut.result()
+                code = row["code"]
+                source = row["source"]
 
-    return out
+                results[code][f"{source}_error"] = row["error"]
+                results[code][f"{source}_temp_c"] = row["temp_c"]
+                results[code][f"{source}_temp_f"] = row["temp_f"]
+                results[code][f"{source}_method"] = row["method"]
 
+    return list(results.values())
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    rows = []
-    for code, airport_name in AIRPORT_SEARCH.items():
-        print(f"\n=== {code} | {airport_name} ===")
-        row = process_airport(code, airport_name)
-        rows.append(row)
+    rows = process_all()
 
-        print("S1 AccuWeather:", row["S1_accuweather_url"])
-        print("S2 BBC        :", row["S2_bbc_url"])
-        print("S3 Weather.com:", row["S3_weathercom_url"])
-        print(
-            "Today highs   :",
-            {
-                "S1_C": row["S1_accuweather_today_high_c"],
-                "S2_C": row["S2_bbc_today_high_c"],
-                "S3_C": row["S3_weathercom_today_high_c"],
-            }
-        )
+    for row in rows:
+        print(f'\n=== {row["code"]} | {row["airport"]} ===')
+        print("Local now:", row["local_now"])
+        print("S1:", row["S1_temp_c"], "C |", row["S1_temp_f"], "F |", row["S1_method"], "|", row["S1_error"])
+        print("S2:", row["S2_temp_c"], "C |", row["S2_temp_f"], "F |", row["S2_method"], "|", row["S2_error"])
+        print("S3:", row["S3_temp_c"], "C |", row["S3_temp_f"], "F |", row["S3_method"], "|", row["S3_error"])
 
-    # pretty json
-    print("\n\nFINAL_JSON =")
+    print("\nFINAL_JSON =")
     print(json.dumps(rows, indent=2, ensure_ascii=False))
 
 
