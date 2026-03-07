@@ -1,6 +1,8 @@
+import math
 import os
 import re
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 
 from selenium import webdriver
@@ -32,18 +34,37 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 OUTPUT_PATH = os.path.join(DATA_DIR, "observations.parquet")
 
+TEMP_XPATH = '//div[contains(@class,"current-temp")]//span[contains(@class,"wu-unit-temperature")]'
+N_WORKERS = min(4, len(STATIONS))
+PAGE_TIMEOUT = 12
+
 
 def make_driver() -> webdriver.Chrome:
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1800,2600")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--no-first-run")
+    options.add_argument("--mute-audio")
+    options.add_argument("--window-size=1400,1200")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
     )
+
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+    options.page_load_strategy = "eager"
+
     return webdriver.Chrome(options=options)
 
 
@@ -51,17 +72,12 @@ def build_weather_url(station_id: str) -> str:
     return f"https://www.wunderground.com/weather/{station_id}"
 
 
-def wait_for_weather_page(driver: webdriver.Chrome, timeout: int = 30) -> None:
+def wait_for_weather_page(driver: webdriver.Chrome, timeout: int = PAGE_TIMEOUT) -> None:
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "p.timestamp"))
     )
     WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located(
-            (
-                By.XPATH,
-                '//div[contains(@class,"current-temp")]//span[contains(@class,"wu-unit-temperature")]',
-            )
-        )
+        EC.visibility_of_element_located((By.XPATH, TEMP_XPATH))
     )
 
 
@@ -70,7 +86,6 @@ def parse_temp_to_celsius(temp_text: str) -> float | None:
         return None
 
     s = " ".join(str(temp_text).replace("\xa0", " ").split()).strip()
-
     m = re.search(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?", s, flags=re.IGNORECASE)
     if not m:
         return None
@@ -113,17 +128,11 @@ def parse_timestamp_from_page(timestamp_text: str) -> pd.Timestamp | None:
 
 
 def fetch_station_row(driver: webdriver.Chrome, airport: str, station_id: str) -> dict:
-    url = build_weather_url(station_id)
-    print(f"  loading {url}")
-
-    driver.get(url)
+    driver.get(build_weather_url(station_id))
     wait_for_weather_page(driver)
 
     timestamp_text = driver.find_element(By.CSS_SELECTOR, "p.timestamp").text
-    temp_text = driver.find_element(
-        By.XPATH,
-        '//div[contains(@class,"current-temp")]//span[contains(@class,"wu-unit-temperature")]',
-    ).text
+    temp_text = driver.find_element(By.XPATH, TEMP_XPATH).text
 
     timestamp_local = parse_timestamp_from_page(timestamp_text)
     temp_c = parse_temp_to_celsius(temp_text)
@@ -150,12 +159,18 @@ def load_existing(path: str) -> pd.DataFrame:
     return pd.DataFrame(columns=["airport", "timestamp_local", "temp"])
 
 
-def main() -> None:
+def chunk_list(xs: list, n_chunks: int) -> list[list]:
+    n_chunks = max(1, n_chunks)
+    chunk_size = math.ceil(len(xs) / n_chunks)
+    return [xs[i:i + chunk_size] for i in range(0, len(xs), chunk_size)]
+
+
+def worker(items: list[tuple[str, dict]]) -> list[dict]:
     driver = make_driver()
     rows = []
 
     try:
-        for airport, meta in STATIONS.items():
+        for airport, meta in items:
             print(f"Fetching {airport}")
             try:
                 row = fetch_station_row(driver, airport, meta["station_id"])
@@ -163,11 +178,21 @@ def main() -> None:
                 print(f"  local={row['timestamp_local']} temp_c={row['temp']}")
             except Exception as e:
                 print(f"  FAILED: {e}")
-
-            time.sleep(1)
-
     finally:
         driver.quit()
+
+    return rows
+
+
+def main() -> None:
+    station_items = list(STATIONS.items())
+    chunks = chunk_list(station_items, N_WORKERS)
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
+        futures = [executor.submit(worker, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            rows.extend(future.result())
 
     if not rows:
         print("No rows fetched; nothing saved.")
