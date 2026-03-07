@@ -5,6 +5,9 @@ on:
     - cron: "*/15 * * * *"   # run every 30 minutes
   workflow_dispatch:          # allow manual run
 
+permissions:
+  contents: write
+
 jobs:
   build-forecast:
     runs-on: ubuntu-latest
