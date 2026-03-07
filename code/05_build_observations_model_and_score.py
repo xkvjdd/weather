@@ -28,7 +28,8 @@ FORECAST_MODEL_PATH = DATA_DIR / "forecast_model.parquet"
 PEAK_OFFSET_PATH = MODEL_DIR / "peak_offset_by_city_month.csv"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-HTTP_TIMEOUT = 30
+HTTP_TIMEOUT = 60
+HTTP_RETRIES = 3
 
 PAST_DAYS = 3
 FORECAST_DAYS = 2
@@ -117,7 +118,6 @@ def get_required_columns_from_models(models: dict) -> list[str]:
     for _, _, transformer_cols in preprocess.transformers_:
         cols.extend(list(transformer_cols))
 
-    # preserve order, remove duplicates
     seen = set()
     out = []
     for c in cols:
@@ -184,41 +184,51 @@ def fetch_open_meteo_airport(meta: dict) -> pd.DataFrame:
         "precipitation_unit": "mm",
     }
 
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
+    last_err = None
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            r = requests.get(OPEN_METEO_URL, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
 
-    hourly = data.get("hourly", {})
-    daily = data.get("daily", {})
+            hourly = data.get("hourly", {})
+            daily = data.get("daily", {})
 
-    if not hourly or "time" not in hourly:
-        raise RuntimeError(f"No hourly data returned for {meta['icao']}")
+            if not hourly or "time" not in hourly:
+                raise RuntimeError(f"No hourly data returned for {meta['icao']}")
 
-    hdf = pd.DataFrame({
-        "timestamp_local": pd.to_datetime(hourly["time"], errors="coerce"),
-        "temp": pd.to_numeric(hourly.get("temperature_2m"), errors="coerce"),
-        "rhum": pd.to_numeric(hourly.get("relative_humidity_2m"), errors="coerce"),
-        "prcp": pd.to_numeric(hourly.get("precipitation"), errors="coerce"),
-        "wdir": pd.to_numeric(hourly.get("wind_direction_10m"), errors="coerce"),
-        "wspd": pd.to_numeric(hourly.get("wind_speed_10m"), errors="coerce"),
-        "wpgt": pd.to_numeric(hourly.get("wind_gusts_10m"), errors="coerce"),
-        "pres": pd.to_numeric(hourly.get("surface_pressure"), errors="coerce"),
-        "cldc": pd.to_numeric(hourly.get("cloud_cover"), errors="coerce"),
-        "coco": pd.to_numeric(hourly.get("weather_code"), errors="coerce"),
-        "is_daylight": pd.to_numeric(hourly.get("is_day"), errors="coerce"),
-    })
+            hdf = pd.DataFrame({
+                "timestamp_local": pd.to_datetime(hourly["time"], errors="coerce"),
+                "temp": pd.to_numeric(hourly.get("temperature_2m"), errors="coerce"),
+                "rhum": pd.to_numeric(hourly.get("relative_humidity_2m"), errors="coerce"),
+                "prcp": pd.to_numeric(hourly.get("precipitation"), errors="coerce"),
+                "wdir": pd.to_numeric(hourly.get("wind_direction_10m"), errors="coerce"),
+                "wspd": pd.to_numeric(hourly.get("wind_speed_10m"), errors="coerce"),
+                "wpgt": pd.to_numeric(hourly.get("wind_gusts_10m"), errors="coerce"),
+                "pres": pd.to_numeric(hourly.get("surface_pressure"), errors="coerce"),
+                "cldc": pd.to_numeric(hourly.get("cloud_cover"), errors="coerce"),
+                "coco": pd.to_numeric(hourly.get("weather_code"), errors="coerce"),
+                "is_daylight": pd.to_numeric(hourly.get("is_day"), errors="coerce"),
+            })
 
-    ddf = pd.DataFrame({
-        "date_local": pd.to_datetime(daily.get("time"), errors="coerce").normalize(),
-        "sunrise_local": pd.to_datetime(daily.get("sunrise"), errors="coerce"),
-        "sunset_local": pd.to_datetime(daily.get("sunset"), errors="coerce"),
-        "daily_max_temp": pd.to_numeric(daily.get("temperature_2m_max"), errors="coerce"),
-    })
+            ddf = pd.DataFrame({
+                "date_local": pd.to_datetime(daily.get("time"), errors="coerce").normalize(),
+                "sunrise_local": pd.to_datetime(daily.get("sunrise"), errors="coerce"),
+                "sunset_local": pd.to_datetime(daily.get("sunset"), errors="coerce"),
+                "daily_max_temp": pd.to_numeric(daily.get("temperature_2m_max"), errors="coerce"),
+            })
 
-    hdf["date_local"] = hdf["timestamp_local"].dt.normalize()
-    out = hdf.merge(ddf, on="date_local", how="left")
+            hdf["date_local"] = hdf["timestamp_local"].dt.normalize()
+            out = hdf.merge(ddf, on="date_local", how="left")
 
-    return out.sort_values("timestamp_local").reset_index(drop=True)
+            return out.sort_values("timestamp_local").reset_index(drop=True)
+
+        except Exception as e:
+            last_err = e
+            if attempt < HTTP_RETRIES:
+                print(f"  retry {attempt}/{HTTP_RETRIES - 1} for {meta['icao']} after error: {e}")
+            else:
+                raise last_err
 
 
 # ---------------------------------------------------------------------
@@ -230,6 +240,7 @@ def add_time_and_solar_features(df: pd.DataFrame, meta: dict, peak_offsets: pd.D
     out["airport"] = meta["city"]
     out["city"] = meta["city"]
     out["icao"] = meta["icao"]
+    out["tz"] = meta["tz"]
     out["latitude"] = meta["lat"]
     out["longitude"] = meta["lon"]
     out["is_us_airport"] = int(meta["is_us_airport"])
@@ -324,10 +335,27 @@ def add_time_and_solar_features(df: pd.DataFrame, meta: dict, peak_offsets: pd.D
 def keep_today_local_only(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["date_local"] = pd.to_datetime(out["timestamp_local"], errors="coerce").dt.normalize()
-    latest_date = out.groupby("airport", as_index=False)["date_local"].max().rename(columns={"date_local": "keep_date"})
-    out = out.merge(latest_date, on="airport", how="left")
-    out = out[out["date_local"] == out["keep_date"]].copy()
-    return out.drop(columns=["keep_date"])
+
+    keep_rows = []
+    for airport, x in out.groupby("airport", sort=False):
+        if x.empty:
+            continue
+
+        tz_vals = x["tz"].dropna()
+        if tz_vals.empty:
+            continue
+
+        tz_name = tz_vals.iloc[0]
+        today_local = pd.Timestamp(datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None)).normalize()
+
+        y = x[x["date_local"] == today_local].copy()
+        if not y.empty:
+            keep_rows.append(y)
+
+    if not keep_rows:
+        return out.iloc[0:0].copy()
+
+    return pd.concat(keep_rows, ignore_index=True)
 
 
 # ---------------------------------------------------------------------
@@ -339,6 +367,19 @@ def score_latest_rows(obs_model_today: pd.DataFrame, models: dict, required_mode
     for airport, x in obs_model_today.groupby("airport", sort=True):
         x = x.sort_values("timestamp_local").copy()
         if x.empty:
+            continue
+
+        tz_vals = x["tz"].dropna()
+        if tz_vals.empty:
+            print(f"{airport}: skipped scoring (missing tz)")
+            continue
+
+        tz_name = tz_vals.iloc[0]
+        now_local = pd.Timestamp(datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None))
+
+        x = x[x["timestamp_local"] <= now_local].copy()
+        if x.empty:
+            print(f"{airport}: skipped scoring (no rows <= now_local)")
             continue
 
         latest = x.iloc[-1].copy()
@@ -363,7 +404,7 @@ def score_latest_rows(obs_model_today: pd.DataFrame, models: dict, required_mode
 
         score_row = {
             "airport": airport,
-            "run_timestamp_local": latest["timestamp_local"],
+            "run_timestamp_local": now_local,
             "model_bucket": f"h{model_bucket_num}",
             "hours_to_peak": hours_to_peak,
             "solar_noon_local": latest.get("solar_noon_local"),
@@ -445,26 +486,6 @@ def main() -> None:
     print(f"Saved observations model rows: {len(obs_model_today):,} -> {OBS_MODEL_PATH}")
 
     scored = score_latest_rows(obs_model_today, models, required_model_cols)
- 
-    forecast_cols = [
-        "airport",
-        "run_timestamp_local",
-        "model_bucket",
-        "hours_to_peak",
-        "solar_noon_local",
-        "peak_offset_hours",
-        "predicted_peak_time_local",
-        "projected_max_temp",
-        "projected_q50",
-        "projected_q90",
-        "projected_q95",
-    ]
-    
-    if scored.empty:
-        print("No forecast model rows scored. Writing empty forecast_model.parquet.")
-        if not FORECAST_MODEL_PATH.exists():
-            pd.DataFrame(columns=forecast_cols).to_parquet(FORECAST_MODEL_PATH, index=False)
-        return
 
     forecast_cols = [
         "airport",
@@ -479,6 +500,12 @@ def main() -> None:
         "projected_q90",
         "projected_q95",
     ]
+
+    if scored.empty:
+        print("No forecast model rows scored. Writing empty forecast_model.parquet.")
+        if not FORECAST_MODEL_PATH.exists():
+            pd.DataFrame(columns=forecast_cols).to_parquet(FORECAST_MODEL_PATH, index=False)
+        return
 
     existing = load_existing(FORECAST_MODEL_PATH, forecast_cols)
     combined = pd.concat([existing, scored[forecast_cols]], ignore_index=True)
