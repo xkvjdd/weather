@@ -7,3 +7,4 @@ joblib
 requests
 pyarrow
 plotly
+beautifulsoup4
