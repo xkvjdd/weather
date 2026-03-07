@@ -37,22 +37,23 @@ AIRPORTS = {
     "WLG": {"icao": "NZWN", "lat": -41.3272, "lon": 174.8050, "tz": "Pacific/Auckland"},
 }
 
-# Meteofor location paths
-# Format: country-slug / city-slug / airport-page-slug
-METEOFOR_PATHS = {
-    "ATL": "united-states/atlanta/airport-hartsfield-jackson",
-    "NYC": "united-states/new-york/airport-la-guardia",
-    "CHI": "united-states/chicago/airport-ohare",
-    "DAL": "united-states/dallas/airport-love-field",
-    "SEA": "united-states/seattle/airport-seattle-tacoma",
-    "MIA": "united-states/miami/airport-miami",
-    "TOR": "canada/toronto/airport-lester-b-pearson",
-    "PAR": "france/paris/airport-charles-de-gaulle",
-    "SEL": "south-korea/seoul/airport-incheon",
-    "ANK": "turkey/ankara/airport-esenboga",
-    "BUE": "argentina/buenos-aires/airport-ezeiza",
-    "LON": "united-kingdom/london/airport-heathrow",
-    "WLG": "new-zealand/wellington/airport-wellington",
+# Exact BBC Weather pages
+# DAL is BBC's Dallas page, which uses Dallas Love Field as the observation station.
+# SEL uses Seoul page as fallback because BBC airport page for Incheon was not available.
+BBC_WEATHER_URLS = {
+    "ATL": "https://www.bbc.com/weather/4199556",
+    "NYC": "https://www.bbc.com/weather/5123698",
+    "CHI": "https://www.bbc.com/weather/4887479",
+    "DAL": "https://www.bbc.com/weather/4684888",
+    "SEA": "https://www.bbc.com/weather/5809876",
+    "MIA": "https://www.bbc.com/weather/4164181",
+    "TOR": "https://www.bbc.com/weather/6296338",
+    "PAR": "https://www.bbc.com/weather/6269554",
+    "SEL": "https://www.bbc.com/weather/1835848",
+    "ANK": "https://www.bbc.com/weather/6299725",
+    "BUE": "https://www.bbc.com/weather/6300524",
+    "LON": "https://www.bbc.com/weather/2647216",
+    "WLG": "https://www.bbc.com/weather/6244688",
 }
 
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -201,6 +202,7 @@ def make_driver() -> webdriver.Chrome:
 
 def dismiss_common_popups(driver: webdriver.Chrome) -> None:
     selectors = [
+        "#bbccookies-continue-button",
         "button[aria-label='Close']",
         "button[aria-label='close']",
         "button[title='Close']",
@@ -255,7 +257,6 @@ def fetch_wunderground_forecast_high_selenium(
     except Exception:
         pass
 
-    # Strategy 1: direct parse from the almanac table rows
     try:
         rows = driver.find_elements(By.CSS_SELECTOR, "div.row.collapse")
         for row in rows:
@@ -272,7 +273,6 @@ def fetch_wunderground_forecast_high_selenium(
                 if label != "high":
                     continue
 
-                # Forecast column is usually second numeric column in image 1
                 forecast_col = cols[1]
                 span = forecast_col.find_element(By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']")
                 val = clean_temp_to_celsius(extract_number(span.text), unit)
@@ -283,7 +283,6 @@ def fetch_wunderground_forecast_high_selenium(
     except Exception as e:
         print(f"    [{icao}] WARNING: WU row parse error: {e}")
 
-    # Strategy 2: find the exact "High" row and grab first wu-value after it
     try:
         xpath = (
             "//div[contains(@class,'row') and contains(@class,'collapse')]"
@@ -298,10 +297,8 @@ def fetch_wunderground_forecast_high_selenium(
     except Exception:
         pass
 
-    # Strategy 3: page-source regex fallback
     try:
         html = driver.page_source
-        # Look for High row followed by wu-value-to text content
         patterns = [
             r'High.*?wu-value[^>]*>(-?\d+(?:\.\d+)?)</span>',
             r'High.*?wu-value-to[^>]*>(-?\d+(?:\.\d+)?)</span>',
@@ -320,77 +317,89 @@ def fetch_wunderground_forecast_high_selenium(
 
 
 # ---------------------------------------------------------------------------
-# S2 — Meteofor today's max
+# S2 — BBC today's high
 # ---------------------------------------------------------------------------
 
-def fetch_meteofor_today_max_selenium(
+def fetch_bbc_today_high_selenium(
     driver: webdriver.Chrome,
     airport: str,
     tz_name: str,
 ) -> float | None:
-    path = METEOFOR_PATHS.get(airport)
-    if not path:
-        print(f"    [{airport}] WARNING: no Meteofor path configured")
+    url = BBC_WEATHER_URLS.get(airport)
+    if not url:
+        print(f"    [{airport}] WARNING: no BBC URL configured")
         return None
 
-    url = f"https://meteofor.com/{path}/"
     driver.get(url)
 
     try:
         WebDriverWait(driver, PAGE_TIMEOUT).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-        time.sleep(2.0)
+        time.sleep(1.5)
         dismiss_common_popups(driver)
     except Exception:
-        print(f"    [{airport}] WARNING: Meteofor body did not load")
+        print(f"    [{airport}] WARNING: BBC body did not load")
         return None
 
-    # Strategy 1: active weather tab contains <temperature-value value="21" ...>
     try:
-        active_tab = driver.find_element(By.CSS_SELECTOR, ".weathertab.is-active, .weathertabs .is-active")
-        temps = active_tab.find_elements(By.CSS_SELECTOR, "temperature-value[value]")
-        vals = []
-        for t in temps:
-            raw = t.get_attribute("value")
-            num = clean_temp_to_celsius(extract_number(raw), "C")
-            if num is not None:
-                vals.append(num)
-        if vals:
-            return round(max(vals), 3)
+        body_text = driver.find_element(By.TAG_NAME, "body").text
     except Exception:
-        pass
+        body_text = ""
 
-    # Strategy 2: any visible today panel values
+    # Strategy 1: first forecast card usually contains Today/Tonight + High xx Low yy
     try:
-        elems = driver.find_elements(By.CSS_SELECTOR, "temperature-value[value]")
-        vals = []
-        for elem in elems:
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/weather/']")
+        for link in links[:20]:
             try:
-                raw = elem.get_attribute("value")
-                num = clean_temp_to_celsius(extract_number(raw), "C")
-                if num is not None and -80 <= num <= 70:
-                    vals.append(num)
+                text = link.text.strip()
+                if not text:
+                    continue
+                low = text.lower()
+
+                is_today_block = (
+                    "today" in low or
+                    "tonight" in low
+                )
+                if not is_today_block:
+                    continue
+
+                m = re.search(r"High\s+(-?\d+(?:\.\d+)?)°", text, flags=re.IGNORECASE)
+                if m:
+                    return clean_temp_to_celsius(m.group(1), "C")
             except Exception:
                 continue
-        if vals:
-            # The page has hourly points + top tiles; max of visible values for today tab
-            return round(max(vals), 3)
     except Exception:
         pass
 
-    # Strategy 3: parse page source for temperature-value entries
+    # Strategy 2: parse page text around Today/Tonight
+    try:
+        patterns = [
+            r"Today.*?High\s+(-?\d+(?:\.\d+)?)°",
+            r"Tonight.*?High\s+(-?\d+(?:\.\d+)?)°",
+        ]
+        for pat in patterns:
+            m = re.search(pat, body_text, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                return clean_temp_to_celsius(m.group(1), "C")
+    except Exception:
+        pass
+
+    # Strategy 3: page source fallback
     try:
         html = driver.page_source
-        matches = re.findall(r'<temperature-value[^>]*value="(-?\d+(?:\.\d+)?)"', html, flags=re.IGNORECASE)
-        vals = [clean_temp_to_celsius(x, "C") for x in matches]
-        vals = [v for v in vals if v is not None and -80 <= v <= 70]
-        if vals:
-            return round(max(vals), 3)
+        patterns = [
+            r"Today.*?High\s+(-?\d+(?:\.\d+)?)°",
+            r"Tonight.*?High\s+(-?\d+(?:\.\d+)?)°",
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                return clean_temp_to_celsius(m.group(1), "C")
     except Exception:
         pass
 
-    print(f"    [{airport}] WARNING: could not parse Meteofor today max")
+    print(f"    [{airport}] WARNING: could not parse BBC today high")
     return None
 
 
@@ -422,7 +431,7 @@ def process_airport(airport: str, meta: dict) -> dict | None:
     icao = meta["icao"]
 
     driver = make_driver()
-    _ = make_api_session()  # kept in case you want requests-based sources later
+    _ = make_api_session()
 
     try:
         pulled_at_local = now_local_naive(tz_name)
@@ -431,28 +440,26 @@ def process_airport(airport: str, meta: dict) -> dict | None:
         observed_max = load_observed_max_today(airport, tz_name)
         print(f"  [{airport}] Observed max today = {observed_max}")
 
-        # S1 — Wunderground forecast almanac high
+        # S1 — Wunderground
         src1 = None
         try:
             src1 = fetch_wunderground_forecast_high_selenium(driver, icao, tz_name)
         except Exception as e:
             print(f"  [{airport}] S1 Wunderground FAILED: {e}")
 
-        # S2 — Meteofor today max
+        # S2 — BBC
         src2 = None
         try:
-            src2 = fetch_meteofor_today_max_selenium(driver, airport, tz_name)
+            src2 = fetch_bbc_today_high_selenium(driver, airport, tz_name)
         except Exception as e:
-            print(f"  [{airport}] S2 Meteofor FAILED: {e}")
+            print(f"  [{airport}] S2 BBC FAILED: {e}")
 
-        # S3 — intentionally blank for now
+        # S3 — blank for now
         src3 = math.nan
 
         avg_val = mean_ignore_none([src1, src2, src3])
 
-        print(
-            f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={avg_val}"
-        )
+        print(f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={avg_val}")
 
         return {
             "airport":             airport,
@@ -465,7 +472,7 @@ def process_airport(airport: str, meta: dict) -> dict | None:
             "forecast_avg_max":    avg_val,
             "observed_max_today":  observed_max,
             "source_1_name":       "wunderground_forecast_high",
-            "source_2_name":       "meteofor_today_max",
+            "source_2_name":       "bbc_today_high",
             "source_3_name":       "nan",
         }
 
