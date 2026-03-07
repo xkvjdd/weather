@@ -7,7 +7,7 @@ st.set_page_config(page_title="Weather Max Dashboard", layout="wide")
 
 DATA_DIR = "data/dashboard"
 OBS_PATH = os.path.join(DATA_DIR, "observations.parquet")
-MODEL_PATH = os.path.join(DATA_DIR, "model_history.parquet")
+MODEL_PATH = os.path.join(DATA_DIR, "forecast_model.parquet")
 FORECAST_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
 RANK_PATH = os.path.join(DATA_DIR, "airport_rankings.parquet")
 AUTO_REFRESH_SECONDS = 300
