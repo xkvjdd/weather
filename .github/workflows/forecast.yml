@@ -1,7 +1,7 @@
 name: Build Forecast Latest
 on:
   schedule:
-    - cron: "8,38 * * * *"
+    - cron: "8,18,28,38,48,58 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -15,6 +15,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
