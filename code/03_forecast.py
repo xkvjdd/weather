@@ -1,635 +1,476 @@
-import json
+# Requirements: requests, pandas, pyarrow, selenium, webdriver-manager
+
+import math
 import os
 import re
+import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 
-MAX_WORKERS_HTTP = 24
-MAX_WORKERS_SELENIUM = 3
-TIMEOUT = 12
+AIRPORTS = {
+    "ATL": {"icao": "KATL", "lat": 33.6407, "lon": -84.4277, "tz": "America/New_York"},
+    "NYC": {"icao": "KLGA", "lat": 40.7769, "lon": -73.8740, "tz": "America/New_York"},
+    "CHI": {"icao": "KORD", "lat": 41.9742, "lon": -87.9073, "tz": "America/Chicago"},
+    "DAL": {"icao": "KDAL", "lat": 32.8471, "lon": -96.8517, "tz": "America/Chicago"},
+    "SEA": {"icao": "KSEA", "lat": 47.4502, "lon": -122.3088, "tz": "America/Los_Angeles"},
+    "MIA": {"icao": "KMIA", "lat": 25.7959, "lon": -80.2870, "tz": "America/New_York"},
+    "TOR": {"icao": "CYYZ", "lat": 43.6777, "lon": -79.6248, "tz": "America/Toronto"},
+    "PAR": {"icao": "LFPG", "lat": 49.0097, "lon": 2.5479, "tz": "Europe/Paris"},
+    "SEL": {"icao": "RKSI", "lat": 37.4602, "lon": 126.4407, "tz": "Asia/Seoul"},
+    "ANK": {"icao": "LTAC", "lat": 40.1281, "lon": 32.9951, "tz": "Europe/Istanbul"},
+    "BUE": {"icao": "SAEZ", "lat": -34.8222, "lon": -58.5358, "tz": "America/Argentina/Buenos_Aires"},
+    "LON": {"icao": "EGLC", "lat": 51.5053, "lon": 0.0553, "tz": "Europe/London"},
+    "WLG": {"icao": "NZWN", "lat": -41.3272, "lon": 174.8050, "tz": "Pacific/Auckland"},
+}
 
-DATA_DIR = "data/dashboard"
-FORECAST_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
+BBC_WEATHER_URLS = {
+    "ATL": "https://www.bbc.com/weather/4199556",  # Hartsfield–Jackson Atlanta International Airport
+    "NYC": "https://www.bbc.com/weather/5123698",  # La Guardia Airport
+    "CHI": "https://www.bbc.com/weather/4887479",  # Chicago O'Hare International Airport
+    "DAL": "https://www.bbc.com/weather/4684888",  # Dallas (TX) page; observation station is Dallas Love Field
+    "SEA": "https://www.bbc.com/weather/5809876",  # Seattle-Tacoma International Airport
+    "MIA": "https://www.bbc.com/weather/4164181",  # Miami International Airport
+    "TOR": "https://www.bbc.com/weather/6296338",  # Toronto Pearson International Airport
+    "PAR": "https://www.bbc.com/weather/6269554",  # Paris Charles de Gaulle Airport
+    "SEL": "https://www.bbc.com/weather/1835848",  # Seoul fallback; BBC did not expose a working Incheon airport page
+    "ANK": "https://www.bbc.com/weather/6299725",  # Ankara Esenboğa International Airport
+    "BUE": "https://www.bbc.com/weather/6300524",  # Ministro Pistarini International Airport (Ezeiza)
+    "LON": "https://www.bbc.com/weather/6296599",  # London City Airport
+    "WLG": "https://www.bbc.com/weather/6244688",  # Wellington International Airport
+}
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+DATA_DIR = os.path.join(REPO_ROOT, "data", "dashboard")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+OUTPUT_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
+OBSERVATIONS_PATH = os.path.join(DATA_DIR, "observations.parquet")
+OBSERVATIONS_COPY = os.path.join(DATA_DIR, "observations_copy.parquet")
+
+HTTP_TIMEOUT = 15
+PAGE_TIMEOUT = 12
+MAX_WORKERS = 3
+
+CHROMEDRIVER_PATH = ChromeDriverManager().install()
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/145.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-AIRPORT_META = {
-    "ATL": {"name": "Hartsfield Jackson Atlanta International Airport", "tz": "America/New_York"},
-    "NYC": {"name": "LaGuardia Airport", "tz": "America/New_York"},
-    "CHI": {"name": "O'Hare International Airport", "tz": "America/Chicago"},
-    "DAL": {"name": "Dallas Love Field", "tz": "America/Chicago"},
-    "SEA": {"name": "Seattle Tacoma International Airport", "tz": "America/Los_Angeles"},
-    "MIA": {"name": "Miami International Airport", "tz": "America/New_York"},
-    "TOR": {"name": "Toronto Pearson International Airport", "tz": "America/Toronto"},
-    "PAR": {"name": "Charles de Gaulle Airport", "tz": "Europe/Paris"},
-    "SEL": {"name": "Incheon International Airport", "tz": "Asia/Seoul"},
-    "ANK": {"name": "Esenboga Airport", "tz": "Europe/Istanbul"},
-    "BUE": {"name": "Ezeiza International Airport", "tz": "America/Argentina/Buenos_Aires"},
-    "LON": {"name": "London City Airport", "tz": "Europe/London"},
-    "WLG": {"name": "Wellington Airport", "tz": "Pacific/Auckland"},
-}
-
-# S1 = AccuWeather
-# S2 = BBC
-# S3 = Weather.com
-AIRPORT_LINKS = {
-    "ATL": {
-        "S1": "https://www.accuweather.com/en/us/hartsfield-jackson-atlanta-international-airport/30320/weather-forecast/9416_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/33.6407,-84.4277",
-    },
-    "NYC": {
-        "S1": "https://www.accuweather.com/en/us/la-guardia-airport/11371/weather-forecast/26272_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/40.7772,-73.8726",
-    },
-    "CHI": {
-        "S1": "https://www.accuweather.com/en/us/chicago-ohare-international-airport/60666/weather-forecast/72530_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/41.9742,-87.9073",
-    },
-    "DAL": {
-        "S1": "https://www.accuweather.com/en/us/dallas-love-field/75235/weather-forecast/35119_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/32.8481,-96.8512",
-    },
-    "SEA": {
-        "S1": "https://www.accuweather.com/en/us/seattle-tacoma-international-airport/98158/weather-forecast/351409_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/47.4502,-122.3088",
-    },
-    "MIA": {
-        "S1": "https://www.accuweather.com/en/us/miami-international-airport/33122/weather-forecast/348308_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/25.7959,-80.2870",
-    },
-    "TOR": {
-        "S1": "https://www.accuweather.com/en/ca/toronto-pearson-international-airport/l5p/weather-forecast/35185_poi",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/43.6777,-79.6248",
-    },
-    "PAR": {
-        "S1": "https://www.accuweather.com/en/fr/roissy-en-france/135713/weather-forecast/135713",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/49.0097,2.5479",
-    },
-    "SEL": {
-        "S1": "https://www.accuweather.com/en/kr/incheon/226081/weather-forecast/226081",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/37.4602,126.4407",
-    },
-    "ANK": {
-        "S1": "https://www.accuweather.com/en/tr/esenboga-havalimani/318795/weather-forecast/318795",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/40.1281,32.9951",
-    },
-    "BUE": {
-        "S1": "https://www.accuweather.com/en/ar/ezeiza/7894/weather-forecast/7894",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/-34.8222,-58.5358",
-    },
-    "LON": {
-        "S1": "https://www.accuweather.com/en/gb/london-city-airport/e16-2/weather-forecast/5375_poi",
-        "S2": "https://www.bbc.com/weather/6296599",
-        "S3": "https://weather.com/weather/tenday/l/51.5053,-0.0553",
-    },
-    "WLG": {
-        "S1": "https://www.accuweather.com/en/nz/wellington/250938/weather-forecast/250938",
-        "S2": "",
-        "S3": "https://weather.com/weather/tenday/l/-41.3272,174.8052",
-    },
+    )
 }
 
 
-def clean_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def now_local_naive(tz_name: str) -> pd.Timestamp:
+    return pd.Timestamp(datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None))
 
 
-def now_local_dt(code: str) -> datetime:
-    return datetime.now(ZoneInfo(AIRPORT_META[code]["tz"]))
+def today_local_str(tz_name: str) -> str:
+    return datetime.now(ZoneInfo(tz_name)).date().isoformat()
 
 
-def now_local_str(code: str) -> str:
-    return now_local_dt(code).strftime("%Y-%m-%d %H:%M:%S %Z")
+def clean_temp_to_celsius(value, unit: str | None = None) -> float | None:
+    if value is None:
+        return None
+    try:
+        x = float(value)
+    except Exception:
+        return None
+    u = (unit or "C").upper()
+    if u == "F":
+        return round((x - 32.0) * 5.0 / 9.0, 3)
+    return round(x, 3)
 
 
-def c_to_f(c: float) -> float:
-    return round(c * 9 / 5 + 32, 1)
+def mean_ignore_none(values: list[float | None]) -> float | None:
+    xs = [float(v) for v in values if v is not None and not pd.isna(v)]
+    if not xs:
+        return None
+    return round(sum(xs) / len(xs), 3)
 
 
-def f_to_c(f: float) -> float:
-    return round((f - 32) * 5 / 9, 1)
-
-
-def first_int(text: str):
+def extract_number(text: str) -> float | None:
     if text is None:
         return None
-    m = re.search(r"-?\d+", text)
-    return int(m.group()) if m else None
-
-
-def mean_ignore_none(values):
-    vals = [float(v) for v in values if v is not None and pd.notna(v)]
-    if not vals:
+    m = re.search(r"-?\d+(?:\.\d+)?", str(text).replace(",", ""))
+    if not m:
         return None
-    return round(sum(vals) / len(vals), 3)
-
-
-def infer_accuweather_unit(code: str, final_url: str, text: str = "") -> str:
-    code = (code or "").upper()
-    final_url = (final_url or "").lower()
-    text = (text or "").lower()
-
-    # Based on observed output from these airport pages
-    if code in {"ATL", "NYC", "CHI", "DAL", "SEA", "MIA", "BUE", "LON", "WLG"}:
-        return "F"
-
-    if "/en/us/" in final_url:
-        return "F"
-
-    if "fahrenheit" in text or "°f" in text:
-        return "F"
-
-    return "C"
-
-
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-
-def fetch_text(session: requests.Session, url: str):
-    if not url:
-        return None, None, "blank_url"
     try:
-        r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        r.raise_for_status()
-        return r.text, r.url, None
-    except Exception as e:
-        return None, None, f"{type(e).__name__}: {e}"
+        return float(m.group(0))
+    except Exception:
+        return None
 
 
-def make_edge_driver() -> webdriver.Edge:
-    opts = webdriver.EdgeOptions()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1400,2000")
-    opts.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    )
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
+# ---------------------------------------------------------------------------
+# Observations snapshot
+# ---------------------------------------------------------------------------
 
-    driver = webdriver.Edge(options=opts)
-    driver.set_page_load_timeout(25)
-    driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-    return driver
+def snapshot_observations() -> None:
+    if os.path.exists(OBSERVATIONS_PATH):
+        shutil.copy2(OBSERVATIONS_PATH, OBSERVATIONS_COPY)
+        print(f"Snapshotted observations -> {OBSERVATIONS_COPY}")
+    else:
+        print(f"WARNING: observations.parquet not found at {OBSERVATIONS_PATH}, copy skipped.")
 
 
-def fetch_weathercom_selenium(url: str):
-    if not url:
-        return None, None, "blank_url"
+def cleanup_observations_copy() -> None:
+    if os.path.exists(OBSERVATIONS_COPY):
+        os.remove(OBSERVATIONS_COPY)
+        print(f"Deleted observations copy: {OBSERVATIONS_COPY}")
 
-    driver = None
+
+def load_observed_max_today(airport: str, local_date: str) -> float | None:
+    if not os.path.exists(OBSERVATIONS_COPY):
+        return None
     try:
-        driver = make_edge_driver()
-        driver.get(url)
-
-        WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="TemperatureValue"]'))
+        obs = pd.read_parquet(OBSERVATIONS_COPY)
+        mask = (
+            (obs["airport"] == airport) &
+            (obs["timestamp_local"].astype(str).str[:10] == local_date)
         )
-
-        html = driver.page_source
-        final_url = driver.current_url
-        return html, final_url, None
+        todays = obs.loc[mask, "temp"].dropna()
+        if todays.empty:
+            return None
+        return round(float(todays.max()), 3)
     except Exception as e:
-        return None, None, f"{type(e).__name__}: {e}"
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        print(f"    [{airport}] WARNING: could not read observations_copy: {e}")
+        return None
 
 
-# ============================================================
-# S1 ACCUWEATHER
-# ============================================================
+# ---------------------------------------------------------------------------
+# Selenium
+# ---------------------------------------------------------------------------
 
-def parse_accuweather_today_high(code: str, html: str, final_url: str = None):
-    soup = BeautifulSoup(html, "html.parser")
+def make_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--no-first-run")
+    options.add_argument("--mute-audio")
+    options.add_argument("--window-size=1600,1200")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(f"--user-agent={HEADERS['User-Agent']}")
+    options.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    })
+    options.page_load_strategy = "eager"
+    return webdriver.Chrome(
+        service=Service(CHROMEDRIVER_PATH),
+        options=options,
+    )
 
-    def build_result(temp_raw: int, method: str, match_text: str):
-        unit = infer_accuweather_unit(code, final_url or "", match_text)
-        if unit == "F":
-            return {
-                "temp_f": float(temp_raw),
-                "temp_c": f_to_c(temp_raw),
-                "method": method,
-                "match_text": match_text[:300],
-            }
-        return {
-            "temp_c": float(temp_raw),
-            "temp_f": c_to_f(temp_raw),
-            "method": method,
-            "match_text": match_text[:300],
-        }
 
-    for idx, row in enumerate(soup.select("a.daily-list-item")):
-        hi = row.select_one("span.temp-hi")
-        if hi:
-            temp_raw = first_int(hi.get_text(" ", strip=True))
-            if temp_raw is not None:
-                row_text = clean_text(row.get_text(" ", strip=True))
-                return build_result(temp_raw, f"accuweather_daily_list_temp_hi_{idx}", row_text)
-
-    for idx, card in enumerate(soup.select("div.today-forecast-card")):
-        txt = clean_text(card.get_text(" ", strip=True))
-        m = re.search(r"\bHi\s*:\s*(-?\d+)", txt, flags=re.I)
-        if m:
-            temp_raw = int(m.group(1))
-            return build_result(temp_raw, f"accuweather_today_card_{idx}", txt)
-
-    hi = soup.select_one("span.temp-hi")
-    if hi:
-        temp_raw = first_int(hi.get_text(" ", strip=True))
-        if temp_raw is not None:
-            txt = clean_text(hi.get_text(" ", strip=True))
-            return build_result(temp_raw, "accuweather_span_temp_hi", txt)
-
-    raw_patterns = [
-        r'<span[^>]*class="[^"]*temp-hi[^"]*"[^>]*>\s*(-?\d+)\s*°?\s*</span>',
-        r"\bHi\s*:\s*(-?\d+)\s*°",
+def dismiss_common_popups(driver: webdriver.Chrome) -> None:
+    selectors = [
+        "#bbccookies-continue-button",
+        "button[aria-label='Close']",
+        "button[aria-label='close']",
+        "button[title='Close']",
+        "button[title='close']",
+        ".fc-button.fc-cta-consent.fc-primary-button",
     ]
-    for i, patt in enumerate(raw_patterns, start=1):
-        m = re.search(patt, html, flags=re.I | re.S)
-        if m:
-            temp_raw = int(m.group(1))
-            return build_result(temp_raw, f"accuweather_regex_{i}", m.group(0))
+    for sel in selectors:
+        try:
+            for elem in driver.find_elements(By.CSS_SELECTOR, sel)[:2]:
+                try:
+                    driver.execute_script("arguments[0].click();", elem)
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
+
+# ---------------------------------------------------------------------------
+# S1 — Wunderground
+# ---------------------------------------------------------------------------
+
+def fetch_wunderground_forecast_high_selenium(
+    driver: webdriver.Chrome,
+    icao: str,
+    local_date: str,
+) -> float | None:
+    url = f"https://www.wunderground.com/history/daily/{icao}/date/{local_date}"
+    driver.get(url)
+
+    try:
+        WebDriverWait(driver, PAGE_TIMEOUT).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        time.sleep(0.8)
+        dismiss_common_popups(driver)
+    except Exception:
+        print(f"    [{icao}] WARNING: body did not load")
+        return None
+
+    unit = "F"
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        if "°C" in body_text:
+            unit = "C"
+    except Exception:
+        pass
+
+    try:
+        rows = driver.find_elements(By.CSS_SELECTOR, "div.row.collapse")
+        for row in rows:
+            try:
+                cols = row.find_elements(By.CSS_SELECTOR, "div.columns")
+                if len(cols) < 3:
+                    continue
+                label = cols[0].text.strip().lower()
+                if label != "high":
+                    continue
+                span = cols[1].find_element(By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']")
+                val = clean_temp_to_celsius(extract_number(span.text), unit)
+                if val is not None:
+                    return val
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        html = driver.page_source
+        patterns = [
+            r'High.*?wu-value[^>]*>(-?\d+(?:\.\d+)?)</span>',
+            r'High.*?wu-value-to[^>]*>(-?\d+(?:\.\d+)?)</span>',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                val = clean_temp_to_celsius(m.group(1), unit)
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+
+    print(f"    [{icao}] WARNING: could not parse Wunderground forecast high for {local_date}")
     return None
 
 
-# ============================================================
-# S2 BBC
-# ============================================================
+# ---------------------------------------------------------------------------
+# S2 — BBC via requests
+# ---------------------------------------------------------------------------
 
-def parse_bbc_today_high(code: str, html: str):
-    text = clean_text(html)
-    dt = now_local_dt(code)
-    weekday_full = dt.strftime("%A")
-    day_num = str(dt.day)
+def fetch_bbc_today_high_requests(
+    airport: str,
+    session: requests.Session,
+) -> float | None:
+    url = BBC_WEATHER_URLS.get(airport)
+    if not url:
+        print(f"    [{airport}] WARNING: no BBC URL configured")
+        return None
+
+    try:
+        resp = session.get(url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        print(f"    [{airport}] WARNING: BBC request failed: {e}")
+        return None
 
     patterns = [
-        (r'"maxTempC"\s*:\s*(-?\d+)', html),
-        (r'"maximumTemperature"\s*:\s*(-?\d+)', html),
-        (rf"\b{weekday_full}\b.*?\b{day_num}\b.*?\bHigh\b.*?(-?\d+)\s*[°º]C", text),
-        (r"\bHigh\b.*?(-?\d+)\s*[°º]C", text),
+        r"Today\s*,.*?High\s+(-?\d+(?:\.\d+)?)°",
+        r"Tonight\s*,.*?High\s+(-?\d+(?:\.\d+)?)°",
     ]
-
-    for i, (patt, source_text) in enumerate(patterns, start=1):
-        m = re.search(patt, source_text, flags=re.I | re.S)
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
         if m:
-            c = int(m.group(1))
-            return {
-                "temp_c": float(c),
-                "temp_f": c_to_f(c),
-                "method": f"bbc_p{i}",
-                "match_text": m.group(0)[:300],
-            }
+            return clean_temp_to_celsius(m.group(1), "C")
 
+    try:
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                return clean_temp_to_celsius(m.group(1), "C")
+    except Exception:
+        pass
+
+    print(f"    [{airport}] WARNING: could not parse BBC today high")
     return None
 
 
-# ============================================================
-# S3 WEATHER.COM
-# ============================================================
+# ---------------------------------------------------------------------------
+# Purge old rows
+# ---------------------------------------------------------------------------
 
-def parse_weathercom_today_high(code: str, html: str):
-    soup = BeautifulSoup(html, "html.parser")
+def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    keep_mask = df.apply(
+        lambda row: row["forecast_date_local"] == today_local_str(
+            AIRPORTS.get(row["airport"], {}).get("tz", "UTC")
+        ),
+        axis=1,
+    )
+    dropped = int((~keep_mask).sum())
+    if dropped:
+        print(f"  Purged {dropped} row(s) from previous local days")
+    return df[keep_mask].reset_index(drop=True)
 
-    for idx, block in enumerate(soup.select('div[data-testid="DailyContent"]')):
-        temp_span = block.select_one('span[data-testid="TemperatureValue"]')
-        if temp_span:
-            temp_val = first_int(temp_span.get_text(" ", strip=True))
-            if temp_val is not None:
-                block_text = clean_text(block.get_text(" ", strip=True))
-                return {
-                    "temp_f": float(temp_val),
-                    "temp_c": f_to_c(temp_val),
-                    "method": f"weathercom_dailycontent_{idx}",
-                    "match_text": block_text[:300],
-                }
 
-    for idx, summ in enumerate(soup.select('summary[data-testid="Disclosure-Summary"]')):
-        temp_span = summ.select_one('span[data-testid="TemperatureValue"]')
-        if temp_span:
-            temp_val = first_int(temp_span.get_text(" ", strip=True))
-            if temp_val is not None:
-                summ_text = clean_text(summ.get_text(" ", strip=True))
-                return {
-                    "temp_f": float(temp_val),
-                    "temp_c": f_to_c(temp_val),
-                    "method": f"weathercom_summary_{idx}",
-                    "match_text": summ_text[:300],
-                }
+# ---------------------------------------------------------------------------
+# Per-airport worker
+# ---------------------------------------------------------------------------
 
-    raw_patterns = [
-        r'data-testid="DailyContent".{0,600}?data-testid="TemperatureValue"[^>]*>\s*(-?\d+)',
-        r'data-testid="TemperatureValue"[^>]*>\s*(-?\d+)\s*<',
-        r'\bToday\b.{0,300}?(-?\d+)\s*°',
+def process_airport(airport: str, meta: dict) -> dict | None:
+    tz_name = meta["tz"]
+    icao = meta["icao"]
+    local_date = today_local_str(tz_name)
+    pulled_at_local = now_local_naive(tz_name)
+
+    driver = make_driver()
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        observed_max = load_observed_max_today(airport, local_date)
+        print(f"  [{airport}] Observed max today = {observed_max}")
+
+        src1 = None
+        try:
+            src1 = fetch_wunderground_forecast_high_selenium(driver, icao, local_date)
+        except Exception as e:
+            print(f"  [{airport}] S1 Wunderground FAILED: {e}")
+
+        src2 = None
+        try:
+            src2 = fetch_bbc_today_high_requests(airport, session)
+        except Exception as e:
+            print(f"  [{airport}] S2 BBC FAILED: {e}")
+
+        src3 = math.nan
+        avg_val = mean_ignore_none([src1, src2, src3])
+
+        print(f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={avg_val}")
+
+        return {
+            "airport": airport,
+            "icao": icao,
+            "forecast_date_local": local_date,
+            "pulled_at_local": pulled_at_local,
+            "forecast_source_1": src1,
+            "forecast_source_2": src2,
+            "forecast_source_3": src3,
+            "forecast_avg_max": avg_val,
+            "observed_max_today": observed_max,
+            "source_1_name": "wunderground_forecast_high",
+            "source_2_name": "bbc_today_high",
+            "source_3_name": "nan",
+        }
+
+    except Exception as e:
+        print(f"  [{airport}] FAILED: {e}")
+        return None
+
+    finally:
+        session.close()
+        driver.quit()
+
+
+# ---------------------------------------------------------------------------
+# Storage helpers
+# ---------------------------------------------------------------------------
+
+def load_existing(path: str) -> pd.DataFrame:
+    cols = [
+        "airport", "icao", "forecast_date_local", "pulled_at_local",
+        "forecast_source_1", "forecast_source_2", "forecast_source_3",
+        "forecast_avg_max", "observed_max_today",
+        "source_1_name", "source_2_name", "source_3_name",
     ]
-    for i, patt in enumerate(raw_patterns, start=1):
-        m = re.search(patt, html, flags=re.I | re.S)
-        if m:
-            f = int(m.group(1))
-            return {
-                "temp_f": float(f),
-                "temp_c": f_to_c(f),
-                "method": f"weathercom_regex_{i}",
-                "match_text": m.group(0)[:300],
-            }
-
-    return None
+    if os.path.exists(path):
+        df = pd.read_parquet(path)
+        keep = [c for c in cols if c in df.columns]
+        if keep:
+            return df[keep].copy()
+    return pd.DataFrame(columns=cols)
 
 
-def parse_source(code: str, source: str, html: str, final_url: str = None):
-    if source == "S1":
-        return parse_accuweather_today_high(code, html, final_url)
-    if source == "S2":
-        return parse_bbc_today_high(code, html)
-    if source == "S3":
-        return parse_weathercom_today_high(code, html)
-    return None
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
+def main() -> None:
+    snapshot_observations()
 
-def empty_row(code: str):
-    return {
-        "code": code,
-        "airport": AIRPORT_META[code]["name"],
-        "local_now": now_local_str(code),
-        "S1_url": AIRPORT_LINKS[code]["S1"],
-        "S2_url": AIRPORT_LINKS[code]["S2"],
-        "S3_url": AIRPORT_LINKS[code]["S3"],
-        "S1_final_url": None,
-        "S2_final_url": None,
-        "S3_final_url": None,
-        "S1_temp_c": None,
-        "S1_temp_f": None,
-        "S1_method": None,
-        "S1_error": None,
-        "S1_match_text": None,
-        "S2_temp_c": None,
-        "S2_temp_f": None,
-        "S2_method": None,
-        "S2_error": None,
-        "S2_match_text": None,
-        "S3_temp_c": None,
-        "S3_temp_f": None,
-        "S3_method": None,
-        "S3_error": None,
-        "S3_match_text": None,
-    }
+    rows: list[dict] = []
 
-
-def fetch_one_http(session: requests.Session, code: str, source: str, url: str):
-    html, final_url, err = fetch_text(session, url)
-
-    if err:
-        return {
-            "code": code,
-            "source": source,
-            "url": url,
-            "final_url": final_url,
-            "ok": False,
-            "error": err,
-            "temp_c": None,
-            "temp_f": None,
-            "method": None,
-            "match_text": None,
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(process_airport, airport, meta): airport
+            for airport, meta in AIRPORTS.items()
         }
+        for future in as_completed(futures):
+            airport = futures[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    rows.append(result)
+            except Exception as e:
+                print(f"  [{airport}] Unhandled exception: {e}")
 
-    parsed = parse_source(code, source, html, final_url)
-    if not parsed:
-        return {
-            "code": code,
-            "source": source,
-            "url": url,
-            "final_url": final_url,
-            "ok": False,
-            "error": "parse_failed",
-            "temp_c": None,
-            "temp_f": None,
-            "method": None,
-            "match_text": None,
-        }
+    cleanup_observations_copy()
 
-    return {
-        "code": code,
-        "source": source,
-        "url": url,
-        "final_url": final_url,
-        "ok": True,
-        "error": None,
-        "temp_c": parsed["temp_c"],
-        "temp_f": parsed["temp_f"],
-        "method": parsed["method"],
-        "match_text": parsed.get("match_text"),
-    }
+    if not rows:
+        print("No rows fetched; nothing saved.")
+        return
 
+    new_df = pd.DataFrame(rows)
+    existing = load_existing(OUTPUT_PATH)
+    existing = purge_old_forecasts(existing)
+    combined = pd.concat([existing, new_df], ignore_index=True)
 
-def fetch_one_selenium(code: str, source: str, url: str):
-    html, final_url, err = fetch_weathercom_selenium(url)
+    combined["pulled_at_local"] = pd.to_datetime(combined["pulled_at_local"], errors="coerce")
+    for col in [
+        "forecast_source_1", "forecast_source_2", "forecast_source_3",
+        "forecast_avg_max", "observed_max_today"
+    ]:
+        combined[col] = pd.to_numeric(combined[col], errors="coerce")
 
-    if err:
-        return {
-            "code": code,
-            "source": source,
-            "url": url,
-            "final_url": final_url,
-            "ok": False,
-            "error": err,
-            "temp_c": None,
-            "temp_f": None,
-            "method": None,
-            "match_text": None,
-        }
+    combined = combined.dropna(subset=["airport", "pulled_at_local"]).copy()
 
-    parsed = parse_source(code, source, html, final_url)
-    if not parsed:
-        return {
-            "code": code,
-            "source": source,
-            "url": url,
-            "final_url": final_url,
-            "ok": False,
-            "error": "parse_failed",
-            "temp_c": None,
-            "temp_f": None,
-            "method": None,
-            "match_text": None,
-        }
+    combined["bucket_5m"] = combined["pulled_at_local"].dt.floor("5min")
+    combined = (
+        combined.sort_values(["airport", "pulled_at_local"])
+        .drop_duplicates(subset=["airport", "bucket_5m"], keep="last")
+        .drop(columns=["bucket_5m"])
+        .sort_values(["airport", "pulled_at_local"])
+        .reset_index(drop=True)
+    )
 
-    return {
-        "code": code,
-        "source": source,
-        "url": url,
-        "final_url": final_url,
-        "ok": True,
-        "error": None,
-        "temp_c": parsed["temp_c"],
-        "temp_f": parsed["temp_f"],
-        "method": parsed["method"],
-        "match_text": parsed.get("match_text"),
-    }
-
-
-def apply_result(results: dict, row: dict):
-    code = row["code"]
-    source = row["source"]
-    results[code][f"{source}_final_url"] = row["final_url"]
-    results[code][f"{source}_error"] = row["error"]
-    results[code][f"{source}_temp_c"] = row["temp_c"]
-    results[code][f"{source}_temp_f"] = row["temp_f"]
-    results[code][f"{source}_method"] = row["method"]
-    results[code][f"{source}_match_text"] = row["match_text"]
-
-
-def process_all():
-    results = {code: empty_row(code) for code in AIRPORT_META}
-
-    http_jobs = []
-    selenium_jobs = []
-
-    for code, links in AIRPORT_LINKS.items():
-        for source in ("S1", "S2", "S3"):
-            url = links.get(source, "")
-            if not url:
-                results[code][f"{source}_error"] = "blank_url"
-                continue
-
-            if source == "S3":
-                selenium_jobs.append((code, source, url))
-            else:
-                http_jobs.append((code, source, url))
-
-    with make_session() as session:
-        if http_jobs:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS_HTTP) as ex:
-                futures = [
-                    ex.submit(fetch_one_http, session, code, source, url)
-                    for code, source, url in http_jobs
-                ]
-                for fut in as_completed(futures):
-                    apply_result(results, fut.result())
-
-    if selenium_jobs:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS_SELENIUM) as ex:
-            futures = [
-                ex.submit(fetch_one_selenium, code, source, url)
-                for code, source, url in selenium_jobs
-            ]
-            for fut in as_completed(futures):
-                apply_result(results, fut.result())
-
-    return list(results.values())
-
-
-def build_forecast_dataframe(rows):
-    records = []
-
-    for r in rows:
-        s1 = r.get("S1_temp_c")
-        s2 = r.get("S2_temp_c")
-        s3 = r.get("S3_temp_c")
-        avg = mean_ignore_none([s1, s2, s3])
-
-        pulled_local = now_local_dt(r["code"]).strftime("%Y-%m-%d %H:%M:%S")
-
-        records.append(
-            {
-                "airport": r["code"],
-                "forecast_avg_max": avg,
-                "forecast_source_1": s1,
-                "forecast_source_2": s2,
-                "forecast_source_3": s3,
-                "pulled_at_local": pulled_local,
-                "forecast_source_1_method": r.get("S1_method"),
-                "forecast_source_2_method": r.get("S2_method"),
-                "forecast_source_3_method": r.get("S3_method"),
-                "forecast_source_1_error": r.get("S1_error"),
-                "forecast_source_2_error": r.get("S2_error"),
-                "forecast_source_3_error": r.get("S3_error"),
-            }
-        )
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values("airport").reset_index(drop=True)
-    return df
-
-
-def save_forecast_parquet(df: pd.DataFrame, path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_parquet(path, index=False)
-
-
-def main():
-    rows = process_all()
-
-    for row in rows:
-        print(f'\n=== {row["code"]} | {row["airport"]} ===')
-        print("Local now:", row["local_now"])
-
-        print("S1 URL      :", row["S1_url"])
-        print("S1 FINAL URL:", row["S1_final_url"])
-        print("S1 RESULT   :", row["S1_temp_c"], "C |", row["S1_temp_f"], "F |", row["S1_method"], "|", row["S1_error"])
-        print("S1 MATCH    :", row["S1_match_text"])
-
-        print("S2 URL      :", row["S2_url"])
-        print("S2 FINAL URL:", row["S2_final_url"])
-        print("S2 RESULT   :", row["S2_temp_c"], "C |", row["S2_temp_f"], "F |", row["S2_method"], "|", row["S2_error"])
-        print("S2 MATCH    :", row["S2_match_text"])
-
-        print("S3 URL      :", row["S3_url"])
-        print("S3 FINAL URL:", row["S3_final_url"])
-        print("S3 RESULT   :", row["S3_temp_c"], "C |", row["S3_temp_f"], "F |", row["S3_method"], "|", row["S3_error"])
-        print("S3 MATCH    :", row["S3_match_text"])
-
-    print("\nFINAL_JSON =")
-    print(json.dumps(rows, indent=2, ensure_ascii=False))
-
-    df = build_forecast_dataframe(rows)
-    save_forecast_parquet(df, FORECAST_PATH)
-
-    print("\nFORECAST_DF =")
-    print(df.to_string(index=False))
-    print(f"\nSaved forecast parquet -> {FORECAST_PATH}")
+    combined.to_parquet(OUTPUT_PATH, index=False)
+    print(f"\nSaved {len(combined):,} rows -> {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
