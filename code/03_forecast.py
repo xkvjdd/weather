@@ -22,6 +22,9 @@ AIRPORTS = {
     "WLG": {"icao": "NZWN", "lat": -41.3272, "lon": 174.8050, "tz": "Pacific/Auckland"},
 }
 
+# US airports that can use NOAA NWS API
+US_AIRPORTS = {"ATL", "NYC", "CHI", "DAL", "SEA", "MIA"}
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 DATA_DIR = os.path.join(REPO_ROOT, "data", "dashboard")
@@ -33,11 +36,7 @@ HTTP_TIMEOUT = 30
 SLEEP_SECONDS = 0.5
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-    )
+    "User-Agent": "airport-weather-dashboard/1.0 (research project)"
 }
 
 
@@ -79,7 +78,38 @@ def mean_ignore_none(values: list[float | None]) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Source 1: Open-Meteo best-match daily max — today only
+# Source: NOAA NWS (US airports only)
+# Official US government forecast — completely independent model
+# ---------------------------------------------------------------------------
+
+def fetch_noaa_today_high(
+    session: requests.Session,
+    lat: float,
+    lon: float,
+    tz_name: str,
+) -> float | None:
+    # Step 1: resolve lat/lon to NWS grid point
+    r = session.get(f"https://api.weather.gov/points/{lat},{lon}", timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    forecast_url = r.json()["properties"]["forecast"]
+
+    # Step 2: fetch gridpoint forecast periods
+    r2 = session.get(forecast_url, timeout=HTTP_TIMEOUT)
+    r2.raise_for_status()
+    periods = r2.json()["properties"]["periods"]
+
+    today = today_local_str(tz_name)
+    for period in periods:
+        if period["startTime"][:10] == today and period["isDaytime"]:
+            return clean_temp_to_celsius(period["temperature"], period.get("temperatureUnit", "F"))
+
+    print(f"    WARNING: NOAA — no daytime period for {today}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Source: Open-Meteo with explicit model selection
+# Passing start_date=end_date=today (local) ensures no cross-day bleed
 # ---------------------------------------------------------------------------
 
 def fetch_open_meteo_daily_max(
@@ -87,6 +117,7 @@ def fetch_open_meteo_daily_max(
     lat: float,
     lon: float,
     tz_name: str,
+    model: str | None = None,
 ) -> float | None:
     url = "https://api.open-meteo.com/v1/forecast"
     today = today_local_str(tz_name)
@@ -99,6 +130,8 @@ def fetch_open_meteo_daily_max(
         "timezone": tz_name,
         "temperature_unit": "celsius",
     }
+    if model:
+        params["models"] = model
 
     r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
@@ -111,123 +144,65 @@ def fetch_open_meteo_daily_max(
         if d == today and v is not None:
             return clean_temp_to_celsius(v, "C")
 
-    print(f"    WARNING: open-meteo daily — no match for {today}, got dates: {dates}")
+    print(f"    WARNING: Open-Meteo [{model or 'best_match'}] — no match for {today}, got: {dates}")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Source 2: Open-Meteo GFS hourly max — today only, strict date filter
-# ---------------------------------------------------------------------------
-
-def fetch_open_meteo_gfs_hourly_max(
-    session: requests.Session,
-    lat: float,
-    lon: float,
-    tz_name: str,
-) -> float | None:
-    url = "https://api.open-meteo.com/v1/gfs"
-    today = today_local_str(tz_name)
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m",
-        "start_date": today,
-        "end_date": today,
-        "timezone": tz_name,
-        "temperature_unit": "celsius",
-    }
-
-    r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    times = data.get("hourly", {}).get("time", [])
-    temps = data.get("hourly", {}).get("temperature_2m", [])
-
-    xs = []
-    for t, temp in zip(times, temps):
-        if str(t)[:10] == today and temp is not None:
-            v = clean_temp_to_celsius(temp, "C")
-            if v is not None:
-                xs.append(v)
-
-    if xs:
-        return round(max(xs), 3)
-
-    print(f"    WARNING: GFS hourly — no hours matched {today}, available: {sorted(set(str(t)[:10] for t in times))}")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Source 3: Open-Meteo historical/analysis max — today only
-# This uses the historical forecast API which returns analysed values for
-# today rather than a forward forecast, giving a grounded observed-ish high.
-# ---------------------------------------------------------------------------
-
-def fetch_open_meteo_historical_max(
-    session: requests.Session,
-    lat: float,
-    lon: float,
-    tz_name: str,
-) -> float | None:
-    url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-    today = today_local_str(tz_name)
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": today,
-        "end_date": today,
-        "daily": "temperature_2m_max",
-        "timezone": tz_name,
-        "temperature_unit": "celsius",
-    }
-
-    r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    dates = data.get("daily", {}).get("time", [])
-    vals = data.get("daily", {}).get("temperature_2m_max", [])
-
-    for d, v in zip(dates, vals):
-        if d == today and v is not None:
-            return clean_temp_to_celsius(v, "C")
-
-    print(f"    WARNING: historical forecast API — no match for {today}, got dates: {dates}")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Per-airport fetch
+# Per-airport fetch — routes to different source combos by region
+#
+# US airports  → NOAA (independent) + GFS + ECMWF  (3 truly different models)
+# Intl airports → GFS + ECMWF + best-match blend    (2 different NWP + ensemble)
 # ---------------------------------------------------------------------------
 
 def fetch_airport_forecasts(session: requests.Session, airport: str, meta: dict) -> dict:
-    lat = meta["lat"]
-    lon = meta["lon"]
-    tz_name = meta["tz"]
-    icao = meta["icao"]
+    lat, lon, tz_name, icao = meta["lat"], meta["lon"], meta["tz"], meta["icao"]
+    is_us = airport in US_AIRPORTS
 
     pulled_at_local = now_local_naive(tz_name)
     forecast_date_local = today_local_str(tz_name)
 
     src1 = src2 = src3 = None
 
-    try:
-        src1 = fetch_open_meteo_daily_max(session, lat, lon, tz_name)
-    except Exception as e:
-        print(f"  S1 open-meteo daily FAILED: {e}")
+    if is_us:
+        s1_name = "noaa_nws_daytime_high"
+        s2_name = "open_meteo_gfs_seamless_daily_max"
+        s3_name = "open_meteo_ecmwf_ifs04_daily_max"
 
-    try:
-        src2 = fetch_open_meteo_gfs_hourly_max(session, lat, lon, tz_name)
-    except Exception as e:
-        print(f"  S2 GFS hourly FAILED: {e}")
+        try:
+            src1 = fetch_noaa_today_high(session, lat, lon, tz_name)
+        except Exception as e:
+            print(f"  S1 NOAA FAILED: {e}")
 
-    try:
-        src3 = fetch_open_meteo_historical_max(session, lat, lon, tz_name)
-    except Exception as e:
-        print(f"  S3 historical forecast FAILED: {e}")
+        try:
+            src2 = fetch_open_meteo_daily_max(session, lat, lon, tz_name, model="gfs_seamless")
+        except Exception as e:
+            print(f"  S2 GFS FAILED: {e}")
 
-    avg_val = mean_ignore_none([src1, src2, src3])
+        try:
+            src3 = fetch_open_meteo_daily_max(session, lat, lon, tz_name, model="ecmwf_ifs04")
+        except Exception as e:
+            print(f"  S3 ECMWF FAILED: {e}")
+
+    else:
+        s1_name = "open_meteo_gfs_seamless_daily_max"
+        s2_name = "open_meteo_ecmwf_ifs04_daily_max"
+        s3_name = "open_meteo_best_match_daily_max"
+
+        try:
+            src1 = fetch_open_meteo_daily_max(session, lat, lon, tz_name, model="gfs_seamless")
+        except Exception as e:
+            print(f"  S1 GFS FAILED: {e}")
+
+        try:
+            src2 = fetch_open_meteo_daily_max(session, lat, lon, tz_name, model="ecmwf_ifs04")
+        except Exception as e:
+            print(f"  S2 ECMWF FAILED: {e}")
+
+        try:
+            src3 = fetch_open_meteo_daily_max(session, lat, lon, tz_name, model=None)
+        except Exception as e:
+            print(f"  S3 best-match FAILED: {e}")
 
     return {
         "airport": airport,
@@ -237,10 +212,10 @@ def fetch_airport_forecasts(session: requests.Session, airport: str, meta: dict)
         "forecast_source_1": src1,
         "forecast_source_2": src2,
         "forecast_source_3": src3,
-        "forecast_avg_max": avg_val,
-        "source_1_name": "open_meteo_best_match_daily_max",
-        "source_2_name": "open_meteo_gfs_hourly_day_max",
-        "source_3_name": "open_meteo_historical_forecast_daily_max",
+        "forecast_avg_max": mean_ignore_none([src1, src2, src3]),
+        "source_1_name": s1_name,
+        "source_2_name": s2_name,
+        "source_3_name": s3_name,
     }
 
 
@@ -267,15 +242,20 @@ def main() -> None:
     rows = []
 
     for airport, meta in AIRPORTS.items():
-        print(f"Fetching forecast for {airport} ({meta['icao']}) — local date: {today_local_str(meta['tz'])}")
+        is_us = airport in US_AIRPORTS
+        print(
+            f"Fetching {airport} ({meta['icao']}) "
+            f"[{'US: NOAA+GFS+ECMWF' if is_us else 'INTL: GFS+ECMWF+blend'}] "
+            f"local date: {today_local_str(meta['tz'])}"
+        )
         try:
             row = fetch_airport_forecasts(session, airport, meta)
             rows.append(row)
             print(
-                f"  S1={row['forecast_source_1']} "
-                f"S2={row['forecast_source_2']} "
-                f"S3={row['forecast_source_3']} "
-                f"AVG={row['forecast_avg_max']}"
+                f"  S1={row['forecast_source_1']} ({row['source_1_name']})\n"
+                f"  S2={row['forecast_source_2']} ({row['source_2_name']})\n"
+                f"  S3={row['forecast_source_3']} ({row['source_3_name']})\n"
+                f"  AVG={row['forecast_avg_max']}"
             )
         except Exception as e:
             print(f"  FAILED: {e}")
