@@ -429,7 +429,14 @@ st.caption(f"Auto-refresh target: every {AUTO_REFRESH_SECONDS//60} minutes")
 
 airports = rank_airports(rank_df, obs_df)
 
-for airport in airports:
+selected_airports = st.multiselect(
+    "Filter airport",
+    options=airports,
+    default=airports,
+    format_func=airport_label,
+)
+
+for airport in selected_airports:
     st.markdown("---")
 
     chart_col, stat_col = st.columns([4.6, 1.4])
