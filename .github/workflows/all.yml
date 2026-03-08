@@ -49,7 +49,6 @@ jobs:
       - name: Commit updated outputs
         run: |
           git add data/dashboard/observations.parquet || true
-          git add data/dashboard/forecast_latest.parquet || true
           test -f data/dashboard/observations_model.parquet && git add data/dashboard/observations_model.parquet || true
           test -f data/dashboard/forecast_model.parquet && git add data/dashboard/forecast_model.parquet || true
 
