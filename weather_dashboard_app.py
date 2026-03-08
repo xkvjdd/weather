@@ -429,12 +429,25 @@ st.caption(f"Auto-refresh target: every {AUTO_REFRESH_SECONDS//60} minutes")
 
 airports = rank_airports(rank_df, obs_df)
 
-selected_airports = st.multiselect(
-    "Filter airport",
-    options=airports,
-    default=airports,
-    format_func=airport_label,
-)
+if "selected_airports" not in st.session_state:
+    st.session_state.selected_airports = airports.copy()
+
+st.subheader("Filter airport")
+
+filter_cols = st.columns(min(4, max(1, len(airports))))
+
+for i, airport in enumerate(airports):
+    with filter_cols[i % len(filter_cols)]:
+        checked = airport in st.session_state.selected_airports
+
+        if st.checkbox(airport, value=checked, key=f"airport_{airport}"):
+            if airport not in st.session_state.selected_airports:
+                st.session_state.selected_airports.append(airport)
+        else:
+            if airport in st.session_state.selected_airports:
+                st.session_state.selected_airports.remove(airport)
+
+selected_airports = [a for a in airports if a in st.session_state.selected_airports]
 
 for airport in selected_airports:
     st.markdown("---")
