@@ -92,22 +92,16 @@ def mean_ignore_none(values):
 # ------------------------------------------------
 
 def fetch_wunderground_forecast_high(icao):
-
     try:
-
         url = f"https://www.wunderground.com/weather/{icao}"
-
         html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
         m = re.search(r'"temperatureMax":\[(\-?\d+)', html)
-
         if not m:
             return None
 
         temp_f = float(m.group(1))
-
         temp_c = (temp_f - 32) * 5 / 9
-
         return round(temp_c, 3)
 
     except:
@@ -119,18 +113,15 @@ def fetch_wunderground_forecast_high(icao):
 # ------------------------------------------------
 
 def fetch_bbc_today_high(airport):
-
     url = BBC_WEATHER_URLS.get(airport)
 
     if not url:
         return None
 
     try:
-
         html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
         m = re.search(r'High[^0-9-]*(-?\d+)', html)
-
         if m:
             return float(m.group(1))
 
@@ -141,40 +132,31 @@ def fetch_bbc_today_high(airport):
 
 
 # ------------------------------------------------
-# S3 ACCUWEATHER (F → C if needed)
+# S3 ACCUWEATHER (F → C)
 # ------------------------------------------------
 
 def fetch_accuweather_today_high(airport):
-
     url = ACCUWEATHER_URLS.get(airport)
 
     if not url:
         return None
 
     try:
-
         html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
-        m = re.search(r'temp-hi">(\d+)', html)
-
+        m = re.search(r'temp-hi">(-?\d+)', html)
         if not m:
             return None
 
-        temp = float(m.group(1))
-
-        # detect if page uses Fahrenheit
-        if "°F" in html or "degF" in html or "/us/" in url:
-
-            temp = (temp - 32) * 5 / 9
-
-        return round(temp, 3)
+        temp_f = float(m.group(1))
+        temp_c = (temp_f - 32) * 5 / 9
+        return round(temp_c, 3)
 
     except:
         return None
 
 
 def process_airport(airport, meta):
-
     tz = meta["tz"]
     icao = meta["icao"]
 
@@ -204,25 +186,20 @@ def process_airport(airport, meta):
 
 
 def main():
-
     rows = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-
         futures = {
             executor.submit(process_airport, a, m): a
             for a, m in AIRPORTS.items()
         }
 
         for future in as_completed(futures):
-
             r = future.result()
-
             if r:
                 rows.append(r)
 
     df = pd.DataFrame(rows)
-
     df.to_parquet(OUTPUT_PATH, index=False)
 
     print("Saved", len(df), "rows")
