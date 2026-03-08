@@ -182,69 +182,8 @@ def add_model_absolute_max(model_hist, obs_hist):
     return merged
 
 
-def get_forecast_quantile_columns(df):
-    if df.empty:
-        return []
-
-    cols = []
-    for c in df.columns:
-        cl = str(c).lower()
-        if "quantile" in cl or re.search(r"\bq\d+\b", cl):
-            cols.append(c)
-        elif re.search(r"\bp(0?\d|[1-9]\d|100)\b", cl):
-            cols.append(c)
-
-    def sort_key(col):
-        s = str(col).lower()
-
-        m = re.search(r"quantile[_\- ]*([0-9]*\.?[0-9]+)", s)
-        if m:
-            try:
-                v = float(m.group(1))
-                if v <= 1:
-                    v *= 100
-                return v
-            except Exception:
-                pass
-
-        m = re.search(r"\bq([0-9]+)\b", s)
-        if m:
-            return float(m.group(1))
-
-        m = re.search(r"\bp([0-9]+)\b", s)
-        if m:
-            return float(m.group(1))
-
-        return 9999
-
-    return sorted(cols, key=sort_key)
-
-
-def pretty_quantile_name(col):
-    s = str(col)
-
-    m = re.search(r"quantile[_\- ]*([0-9]*\.?[0-9]+)", s.lower())
-    if m:
-        try:
-            v = float(m.group(1))
-            if v <= 1:
-                v *= 100
-            return f"Q{int(round(v))}"
-        except Exception:
-            pass
-
-    m = re.search(r"\bq([0-9]+)\b", s.lower())
-    if m:
-        return f"Q{m.group(1)}"
-
-    m = re.search(r"\bp([0-9]+)\b", s.lower())
-    if m:
-        return f"P{m.group(1)}"
-
-    return s
-
-
 def make_chart(airport, obs_df, model_df, forecast_df):
+
     obs_hist = get_obs(airport, obs_df)
     today_obs = get_today_obs(airport, obs_df)
     yesterday_obs = get_yesterday_obs(airport, obs_df)
@@ -279,38 +218,33 @@ def make_chart(airport, obs_df, model_df, forecast_df):
             )
         )
 
+    # MODEL LINES (ONLY LAST TWO)
     if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
+
         model_plot = model_hist.dropna(subset=["modelled_max_abs"]).copy()
 
         if not model_plot.empty:
-            if len(model_plot) > 1:
-                prior_models = model_plot.iloc[:-1]
-                for i, (_, row) in enumerate(prior_models.iterrows()):
-                    y = safe_float(row.get("modelled_max_abs"))
-                    if y is None:
-                        continue
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[0, 24],
-                            y=[y, y],
-                            mode="lines",
-                            name="Prior modelled max" if i == 0 else None,
-                            line=dict(color="rgba(37,99,235,0.28)", width=2, dash="dot"),
-                            showlegend=(i == 0),
-                        )
-                    )
 
-            latest_row = model_plot.iloc[-1]
-            latest_y = safe_float(latest_row.get("modelled_max_abs"))
-            if latest_y is not None:
+            last_two = model_plot.tail(2)
+
+            for i, (_, row) in enumerate(last_two.iterrows()):
+
+                y = safe_float(row.get("modelled_max_abs"))
+                if y is None:
+                    continue
+
                 fig.add_trace(
                     go.Scatter(
                         x=[0, 24],
-                        y=[latest_y, latest_y],
+                        y=[y, y],
                         mode="lines",
-                        name="Modelled max",
-                        line=dict(color="#2563eb", width=2),
-                        showlegend=True,
+                        name="Recent model forecast" if i == 0 else None,
+                        line=dict(
+                            color="rgba(37,99,235,0.9)",
+                            width=2,
+                            dash="dot"
+                        ),
+                        showlegend=(i == 0),
                     )
                 )
 
@@ -324,22 +258,6 @@ def make_chart(airport, obs_df, model_df, forecast_df):
                     mode="lines",
                     name="Forecast avg max",
                     line=dict(color="green", width=2),
-                )
-            )
-
-        qcols = get_forecast_quantile_columns(latest_fc)
-        for qcol in qcols:
-            qy = safe_float(latest_fc[qcol].iloc[0])
-            if qy is None:
-                continue
-            fig.add_trace(
-                go.Scatter(
-                    x=[0, 24],
-                    y=[qy, qy],
-                    mode="lines",
-                    name=pretty_quantile_name(qcol),
-                    line=dict(color="rgba(168,85,247,0.45)", width=1.5),
-                    showlegend=True,
                 )
             )
 
@@ -369,58 +287,6 @@ def make_chart(airport, obs_df, model_df, forecast_df):
     return fig
 
 
-def airport_stats(airport, obs_df, model_df, forecast_df):
-    obs_hist = get_obs(airport, obs_df)
-    today_obs = get_today_obs(airport, obs_df)
-    model_hist_raw = get_model_hist(airport, model_df)
-    model_hist = add_model_absolute_max(model_hist_raw, obs_hist)
-    latest_fc = get_latest_forecast(airport, forecast_df)
-
-    current_temp = None
-    obs_updated = None
-
-    if not today_obs.empty:
-        row = today_obs.iloc[-1]
-        current_temp = safe_float(row["temp"])
-        obs_updated = row["timestamp_local"]
-
-    model_now = None
-    model_updated = None
-    if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
-        model_now = safe_float(model_hist["modelled_max_abs"].iloc[-1])
-        model_updated = model_hist["run_timestamp_local"].iloc[-1]
-
-    fc_avg = fc1 = fc2 = fc3 = None
-    fc_updated = None
-    quantiles = []
-
-    if not latest_fc.empty:
-        row = latest_fc.iloc[0]
-        fc_avg = safe_float(row.get("forecast_avg_max"))
-        fc1 = safe_float(row.get("forecast_source_1"))
-        fc2 = safe_float(row.get("forecast_source_2"))
-        fc3 = safe_float(row.get("forecast_source_3"))
-        fc_updated = row.get("pulled_at_local")
-
-        for qcol in get_forecast_quantile_columns(latest_fc):
-            qval = safe_float(row.get(qcol))
-            if qval is not None:
-                quantiles.append((pretty_quantile_name(qcol), qval))
-
-    return {
-        "current_temp": current_temp,
-        "model_now": model_now,
-        "fc_avg": fc_avg,
-        "fc1": fc1,
-        "fc2": fc2,
-        "fc3": fc3,
-        "quantiles": quantiles,
-        "obs_updated": obs_updated,
-        "model_updated": model_updated,
-        "fc_updated": fc_updated,
-    }
-
-
 obs_df = load_parquet(OBS_PATH)
 model_df = load_parquet(MODEL_PATH)
 forecast_df = load_parquet(FORECAST_PATH)
@@ -432,6 +298,7 @@ st.caption(f"Auto-refresh target: every {AUTO_REFRESH_SECONDS//60} minutes")
 airports = rank_airports(rank_df, obs_df)
 
 for airport in airports:
+
     st.markdown("---")
 
     chart_col, stat_col = st.columns([4.6, 1.4])
@@ -440,51 +307,4 @@ for airport in airports:
         st.plotly_chart(
             make_chart(airport, obs_df, model_df, forecast_df),
             use_container_width=True,
-        )
-
-    s = airport_stats(airport, obs_df, model_df, forecast_df)
-    airport_obs = get_obs(airport, obs_df)
-
-    with stat_col:
-        local_time = "—"
-        if not airport_obs.empty:
-            local_time = airport_obs["timestamp_local"].max().strftime("%Y-%m-%d %H:%M")
-
-        st.markdown(f"**Local time now**  \n{local_time}")
-
-        st.markdown("")
-
-        st.markdown(
-            f"**Current temp**  \n{fmt_c(s['current_temp'])} | {fmt_f(s['current_temp'])}"
-        )
-
-        st.markdown("")
-
-        st.markdown(
-            f"**Modelled max**  \n{fmt_c(s['model_now'])} | {fmt_f(s['model_now'])}"
-        )
-
-        st.markdown("")
-
-        forecast_lines = [
-            f"**Forecast max**  ",
-            f"Avg: {fmt_c(s['fc_avg'])} | {fmt_f(s['fc_avg'])}",
-            f"S1: {fmt_c(s['fc1'])} | {fmt_f(s['fc1'])}",
-            f"S2: {fmt_c(s['fc2'])} | {fmt_f(s['fc2'])}",
-            f"S3: {fmt_c(s['fc3'])} | {fmt_f(s['fc3'])}",
-        ]
-
-        for qname, qval in s["quantiles"]:
-            forecast_lines.append(f"{qname}: {fmt_c(qval)} | {fmt_f(qval)}")
-
-        st.markdown("  \n".join(forecast_lines))
-
-        st.markdown("")
-
-        st.markdown("**Last updated**")
-
-        st.caption(
-            f"Obs: {fmt_ts(s['obs_updated'])}\n\n"
-            f"Model: {fmt_ts(s['model_updated'])}\n\n"
-            f"Forecast: {fmt_ts(s['fc_updated'])}"
         )
