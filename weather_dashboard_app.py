@@ -279,7 +279,7 @@ def make_chart(airport, obs_df, model_df, forecast_df):
             )
         )
 
-        if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
+    if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
         model_plot = model_hist.dropna(subset=["modelled_max_abs"]).copy()
 
         if not model_plot.empty:
