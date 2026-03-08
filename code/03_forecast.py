@@ -1,6 +1,5 @@
-# Requirements: requests, pandas, pyarrow, selenium, webdriver-manager
+# Requirements: requests, pandas, pyarrow
 
-import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -98,11 +97,7 @@ def fetch_wunderground_forecast_high(icao):
 
         url = f"https://www.wunderground.com/weather/{icao}"
 
-        html = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=HTTP_TIMEOUT
-        ).text
+        html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
         m = re.search(r'"temperatureMax":\[(\-?\d+)', html)
 
@@ -120,7 +115,7 @@ def fetch_wunderground_forecast_high(icao):
 
 
 # ------------------------------------------------
-# S2 BBC (C)
+# S2 BBC (already °C)
 # ------------------------------------------------
 
 def fetch_bbc_today_high(airport):
@@ -132,11 +127,7 @@ def fetch_bbc_today_high(airport):
 
     try:
 
-        html = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=HTTP_TIMEOUT
-        ).text
+        html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
         m = re.search(r'High[^0-9-]*(-?\d+)', html)
 
@@ -150,7 +141,7 @@ def fetch_bbc_today_high(airport):
 
 
 # ------------------------------------------------
-# S3 ACCUWEATHER (C)
+# S3 ACCUWEATHER (F → C if needed)
 # ------------------------------------------------
 
 def fetch_accuweather_today_high(airport):
@@ -162,21 +153,24 @@ def fetch_accuweather_today_high(airport):
 
     try:
 
-        html = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=HTTP_TIMEOUT
-        ).text
+        html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
         m = re.search(r'temp-hi">(\d+)', html)
 
-        if m:
-            return float(m.group(1))
+        if not m:
+            return None
+
+        temp = float(m.group(1))
+
+        # detect if page uses Fahrenheit
+        if "°F" in html or "degF" in html or "/us/" in url:
+
+            temp = (temp - 32) * 5 / 9
+
+        return round(temp, 3)
 
     except:
-        pass
-
-    return None
+        return None
 
 
 def process_airport(airport, meta):
