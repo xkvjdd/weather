@@ -1,60 +1,67 @@
-name: Weather Manual Pipeline
+name: Weather Pipeline
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
+workflow_dispatch:
+schedule:
+- cron: "*/15 * * * *"
 
 permissions:
-  contents: write
+contents: write
 
 concurrency:
-  group: weather-manual-pipeline
-  cancel-in-progress: false
+group: weather-pipeline
+cancel-in-progress: false
 
 jobs:
-  weather_pipeline:
-    runs-on: ubuntu-latest
+weather_pipeline:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
+```
+steps:
+  - name: Checkout repo
+    uses: actions/checkout@v4
+    with:
+      persist-credentials: true
+      fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+  - name: Setup Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
 
-      - name: Pull latest main
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-          git checkout main
-          git pull --ff-only origin main
+  - name: Pull latest main
+    run: |
+      git config --global user.name "github-actions"
+      git config --global user.email "actions@github.com"
+      git checkout main
+      git pull --rebase origin main
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy pyarrow requests beautifulsoup4 selenium scikit-learn joblib
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip
+      pip install pandas numpy pyarrow requests beautifulsoup4 selenium webdriver-manager scikit-learn joblib
 
-      - name: Run live updater
-        run: |
-          python code/02_append_live.py
+  - name: Append live observations
+    run: |
+      python code/02_append_live.py
 
-      - name: Run model pipeline
-        run: |
-          python code/05_build_observations_model_and_score.py
+  - name: Run model pipeline
+    run: |
+      python code/05_build_observations_model_and_score.py
 
-      - name: Commit updated outputs
-        run: |
-          git add data/dashboard/observations.parquet || true
-          test -f data/dashboard/observations_model.parquet && git add data/dashboard/observations_model.parquet || true
-          test -f data/dashboard/forecast_model.parquet && git add data/dashboard/forecast_model.parquet || true
+  - name: Build forecast
+    run: |
+      python code/03_forecast.py
 
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
+  - name: Commit updated outputs
+    run: |
+      git add data/dashboard/observations.parquet || true
+      git add data/dashboard/observations_model.parquet || true
+      git add data/dashboard/forecast_model.parquet || true
+      git add data/dashboard/forecast_latest.parquet || true
 
-          git commit -m "update weather pipeline outputs"
-          git push origin main
+      git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+      git commit -m "update weather pipeline outputs"
+      git push origin main
+```
