@@ -42,10 +42,6 @@ jobs:
         run: |
           python code/02_append_live.py
 
-      - name: Run forecast builder
-        run: |
-          python code/03_forecast.py
-
       - name: Run model pipeline
         run: |
           python code/05_build_observations_model_and_score.py
