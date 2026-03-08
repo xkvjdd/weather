@@ -279,24 +279,36 @@ def make_chart(airport, obs_df, model_df, forecast_df):
             )
         )
 
-    if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
+        if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
         model_plot = model_hist.dropna(subset=["modelled_max_abs"]).copy()
 
         if not model_plot.empty:
             last_two_models = model_plot.tail(2).reset_index(drop=True)
 
-            for i, (_, row) in enumerate(last_two_models.iterrows()):
-                y = safe_float(row.get("modelled_max_abs"))
-                if y is None:
-                    continue
+            if len(last_two_models) == 2:
+                prev_y = safe_float(last_two_models.iloc[0].get("modelled_max_abs"))
+                if prev_y is not None:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[0, 24],
+                            y=[prev_y, prev_y],
+                            mode="lines",
+                            name="Previous modelled max",
+                            line=dict(color="#2563eb", width=2, dash="dot"),
+                            showlegend=True,
+                        )
+                    )
+
+            latest_y = safe_float(last_two_models.iloc[-1].get("modelled_max_abs"))
+            if latest_y is not None:
                 fig.add_trace(
                     go.Scatter(
                         x=[0, 24],
-                        y=[y, y],
+                        y=[latest_y, latest_y],
                         mode="lines",
-                        name="Modelled max (last 2)" if i == 0 else None,
-                        line=dict(color="#2563eb", width=2, dash="dot"),
-                        showlegend=(i == 0),
+                        name="Modelled max",
+                        line=dict(color="#2563eb", width=2),
+                        showlegend=True,
                     )
                 )
 
