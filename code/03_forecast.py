@@ -84,10 +84,6 @@ FORECAST_COLS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def now_local_naive(tz_name: str) -> pd.Timestamp:
     return pd.Timestamp(datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None))
 
@@ -128,10 +124,6 @@ def extract_number(text: str) -> float | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Observations snapshot
-# ---------------------------------------------------------------------------
-
 def snapshot_observations() -> None:
     if os.path.exists(OBSERVATIONS_PATH):
         shutil.copy2(OBSERVATIONS_PATH, OBSERVATIONS_COPY)
@@ -164,128 +156,55 @@ def load_observed_max_today(airport: str, local_date: str) -> float | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Selenium
-# ---------------------------------------------------------------------------
-
 def make_driver() -> webdriver.Chrome:
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-sync")
-    options.add_argument("--disable-default-apps")
-    options.add_argument("--no-first-run")
-    options.add_argument("--mute-audio")
-    options.add_argument("--window-size=1600,1200")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(f"--user-agent={HEADERS['User-Agent']}")
-    options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-    })
     options.page_load_strategy = "eager"
-    return webdriver.Chrome(
-        service=Service(CHROMEDRIVER_PATH),
-        options=options,
-    )
+    return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=options)
 
 
 def dismiss_common_popups(driver: webdriver.Chrome) -> None:
     selectors = [
         "#bbccookies-continue-button",
         "button[aria-label='Close']",
-        "button[aria-label='close']",
-        "button[title='Close']",
-        "button[title='close']",
-        ".fc-button.fc-cta-consent.fc-primary-button",
     ]
     for sel in selectors:
         try:
             for elem in driver.find_elements(By.CSS_SELECTOR, sel)[:2]:
-                try:
-                    driver.execute_script("arguments[0].click();", elem)
-                    time.sleep(0.1)
-                except Exception:
-                    pass
+                driver.execute_script("arguments[0].click();", elem)
         except Exception:
             pass
 
 
-# ---------------------------------------------------------------------------
-# S1 — Wunderground
-# ---------------------------------------------------------------------------
+# UPDATED S1 (Wunderground forecast via requests)
 
 def fetch_wunderground_forecast_high_selenium(
     driver: webdriver.Chrome,
     icao: str,
     local_date: str,
 ) -> float | None:
-    url = f"https://www.wunderground.com/history/daily/{icao}/date/{local_date}"
-    driver.get(url)
-
     try:
-        WebDriverWait(driver, PAGE_TIMEOUT).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        time.sleep(0.8)
-        dismiss_common_popups(driver)
-    except Exception:
-        print(f"    [{icao}] WARNING: body did not load")
+        url = f"https://www.wunderground.com/weather/{icao}"
+        resp = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        html = resp.text
+
+        m = re.search(r'"temperatureMax":\[(\-?\d+)', html)
+        if not m:
+            print(f"    [{icao}] WARNING: temperatureMax not found")
+            return None
+
+        temp_f = float(m.group(1))
+        temp_c = (temp_f - 32.0) * 5.0 / 9.0
+
+        return round(temp_c, 3)
+
+    except Exception as e:
+        print(f"    [{icao}] WARNING: Wunderground parse failed: {e}")
         return None
 
-    unit = "F"
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        if "°C" in body_text:
-            unit = "C"
-    except Exception:
-        pass
-
-    try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "div.row.collapse")
-        for row in rows:
-            try:
-                cols = row.find_elements(By.CSS_SELECTOR, "div.columns")
-                if len(cols) < 3:
-                    continue
-                label = cols[0].text.strip().lower()
-                if label != "high":
-                    continue
-                span = cols[1].find_element(By.CSS_SELECTOR, "span.wu-value, span[class*='wu-value']")
-                val = clean_temp_to_celsius(extract_number(span.text), unit)
-                if val is not None:
-                    return val
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    try:
-        html = driver.page_source
-        patterns = [
-            r'High.*?wu-value[^>]*>(-?\d+(?:\.\d+)?)</span>',
-            r'High.*?wu-value-to[^>]*>(-?\d+(?:\.\d+)?)</span>',
-        ]
-        for pat in patterns:
-            m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
-            if m:
-                val = clean_temp_to_celsius(m.group(1), unit)
-                if val is not None:
-                    return val
-    except Exception:
-        pass
-
-    print(f"    [{icao}] WARNING: could not parse Wunderground forecast high for {local_date}")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# S2 — BBC via requests
-# ---------------------------------------------------------------------------
 
 def fetch_bbc_today_high_requests(
     airport: str,
@@ -293,74 +212,20 @@ def fetch_bbc_today_high_requests(
 ) -> float | None:
     url = BBC_WEATHER_URLS.get(airport)
     if not url:
-        print(f"    [{airport}] WARNING: no BBC URL configured")
         return None
 
     try:
         resp = session.get(url, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
         html = resp.text
-    except Exception as e:
-        print(f"    [{airport}] WARNING: BBC request failed: {e}")
+    except Exception:
         return None
 
-    patterns = [
-        r"Today\s*,.*?High\s+(-?\d+(?:\.\d+)?)°",
-        r"Tonight\s*,.*?High\s+(-?\d+(?:\.\d+)?)°",
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return clean_temp_to_celsius(m.group(1), "C")
+    m = re.search(r"High\s+(-?\d+)", html)
+    if m:
+        return float(m.group(1))
 
-    try:
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-        for pat in patterns:
-            m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
-            if m:
-                return clean_temp_to_celsius(m.group(1), "C")
-    except Exception:
-        pass
-
-    print(f"    [{airport}] WARNING: could not parse BBC today high")
     return None
 
-
-# ---------------------------------------------------------------------------
-# Purge old rows
-# ---------------------------------------------------------------------------
-
-def purge_old_forecasts(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    if "forecast_date_local" not in df.columns or "airport" not in df.columns:
-        print("  Existing parquet missing key columns; dropping old existing rows")
-        return pd.DataFrame(columns=FORECAST_COLS)
-
-    # Force missing values to False so the mask is always pure boolean
-    keep_mask = df.apply(
-        lambda row: (
-            pd.notna(row["forecast_date_local"]) and
-            pd.notna(row["airport"]) and
-            row["forecast_date_local"] == today_local_str(
-                AIRPORTS.get(str(row["airport"]), {}).get("tz", "UTC")
-            )
-        ),
-        axis=1,
-    ).fillna(False).astype(bool)
-
-    dropped = int((~keep_mask).sum())
-    if dropped:
-        print(f"  Purged {dropped} row(s) from previous local days / bad legacy rows")
-
-    return df.loc[keep_mask].reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Per-airport worker
-# ---------------------------------------------------------------------------
 
 def process_airport(airport: str, meta: dict) -> dict | None:
     tz_name = meta["tz"]
@@ -373,25 +238,16 @@ def process_airport(airport: str, meta: dict) -> dict | None:
     session.headers.update(HEADERS)
 
     try:
+
         observed_max = load_observed_max_today(airport, local_date)
-        print(f"  [{airport}] Observed max today = {observed_max}")
 
-        src1 = None
-        try:
-            src1 = fetch_wunderground_forecast_high_selenium(driver, icao, local_date)
-        except Exception as e:
-            print(f"  [{airport}] S1 Wunderground FAILED: {e}")
-
-        src2 = None
-        try:
-            src2 = fetch_bbc_today_high_requests(airport, session)
-        except Exception as e:
-            print(f"  [{airport}] S2 BBC FAILED: {e}")
+        src1 = fetch_wunderground_forecast_high_selenium(driver, icao, local_date)
+        src2 = fetch_bbc_today_high_requests(airport, session)
 
         src3 = math.nan
         avg_val = mean_ignore_none([src1, src2, src3])
 
-        print(f"  [{airport}] S1={src1}  S2={src2}  S3={src3}  AVG={avg_val}")
+        print(f"[{airport}] S1={src1} S2={src2} AVG={avg_val}")
 
         return {
             "airport": airport,
@@ -408,41 +264,19 @@ def process_airport(airport: str, meta: dict) -> dict | None:
             "source_3_name": "nan",
         }
 
-    except Exception as e:
-        print(f"  [{airport}] FAILED: {e}")
-        return None
-
     finally:
         session.close()
         driver.quit()
 
 
-# ---------------------------------------------------------------------------
-# Storage helpers
-# ---------------------------------------------------------------------------
-
 def load_existing(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame(columns=FORECAST_COLS)
+    return pd.read_parquet(path)
 
-    try:
-        df = pd.read_parquet(path).copy()
-    except Exception as e:
-        print(f"WARNING: could not read existing parquet {path}: {e}")
-        return pd.DataFrame(columns=FORECAST_COLS)
-
-    for col in FORECAST_COLS:
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    return df[FORECAST_COLS].copy()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
+
     snapshot_observations()
 
     rows: list[dict] = []
@@ -452,51 +286,25 @@ def main() -> None:
             executor.submit(process_airport, airport, meta): airport
             for airport, meta in AIRPORTS.items()
         }
+
         for future in as_completed(futures):
-            airport = futures[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    rows.append(result)
-            except Exception as e:
-                print(f"  [{airport}] Unhandled exception: {e}")
+            result = future.result()
+            if result:
+                rows.append(result)
 
     cleanup_observations_copy()
 
     if not rows:
-        print("No rows fetched; nothing saved.")
         return
 
     new_df = pd.DataFrame(rows)
-    for col in FORECAST_COLS:
-        if col not in new_df.columns:
-            new_df[col] = pd.NA
-    new_df = new_df[FORECAST_COLS].copy()
 
     existing = load_existing(OUTPUT_PATH)
-    existing = purge_old_forecasts(existing)
     combined = pd.concat([existing, new_df], ignore_index=True)
 
-    combined["pulled_at_local"] = pd.to_datetime(combined["pulled_at_local"], errors="coerce")
-    for col in [
-        "forecast_source_1", "forecast_source_2", "forecast_source_3",
-        "forecast_avg_max", "observed_max_today"
-    ]:
-        combined[col] = pd.to_numeric(combined[col], errors="coerce")
-
-    combined = combined.dropna(subset=["airport", "pulled_at_local"]).copy()
-
-    combined["bucket_5m"] = combined["pulled_at_local"].dt.floor("5min")
-    combined = (
-        combined.sort_values(["airport", "pulled_at_local"])
-        .drop_duplicates(subset=["airport", "bucket_5m"], keep="last")
-        .drop(columns=["bucket_5m"])
-        .sort_values(["airport", "pulled_at_local"])
-        .reset_index(drop=True)
-    )
-
     combined.to_parquet(OUTPUT_PATH, index=False)
-    print(f"\nSaved {len(combined):,} rows -> {OUTPUT_PATH}")
+
+    print(f"\nSaved {len(combined)} rows -> {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
