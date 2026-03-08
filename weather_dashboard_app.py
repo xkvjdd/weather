@@ -141,6 +141,7 @@ def get_latest_forecast(airport, forecast_df):
 
 
 def add_model_absolute_max(model_hist, obs_hist):
+
     if model_hist.empty:
         return model_hist.copy()
 
@@ -173,13 +174,49 @@ def add_model_absolute_max(model_hist, obs_hist):
     )
 
     merged["temp_at_run"] = pd.to_numeric(merged["temp_at_run"], errors="coerce")
+
     merged["modelled_max_abs"] = merged["temp_at_run"] + merged["projected_max_temp"]
+
     merged["modelled_max_abs"] = merged["modelled_max_abs"].where(
         merged["modelled_max_abs"].notna(),
         merged["projected_max_temp"],
     )
 
     return merged
+
+
+def get_forecast_quantile_columns(df):
+
+    if df.empty:
+        return []
+
+    cols = []
+
+    for c in df.columns:
+        cl = str(c).lower()
+
+        if "quantile" in cl or re.search(r"\bq\d+\b", cl):
+            cols.append(c)
+
+        elif re.search(r"\bp(0?\d|[1-9]\d|100)\b", cl):
+            cols.append(c)
+
+    return cols
+
+
+def pretty_quantile_name(col):
+
+    s = str(col)
+
+    m = re.search(r"\bq([0-9]+)\b", s.lower())
+    if m:
+        return f"Q{m.group(1)}"
+
+    m = re.search(r"\bp([0-9]+)\b", s.lower())
+    if m:
+        return f"P{m.group(1)}"
+
+    return s
 
 
 def make_chart(airport, obs_df, model_df, forecast_df):
@@ -207,7 +244,9 @@ def make_chart(airport, obs_df, model_df, forecast_df):
         )
 
     if not today_obs.empty:
+
         x_today = today_obs["timestamp_local"].dt.hour + today_obs["timestamp_local"].dt.minute / 60
+
         fig.add_trace(
             go.Scatter(
                 x=x_today,
@@ -218,7 +257,8 @@ def make_chart(airport, obs_df, model_df, forecast_df):
             )
         )
 
-    # MODEL LINES (ONLY LAST TWO)
+    # MODEL FORECAST (ONLY LAST 2)
+
     if not model_hist.empty and "modelled_max_abs" in model_hist.columns:
 
         model_plot = model_hist.dropna(subset=["modelled_max_abs"]).copy()
@@ -230,6 +270,7 @@ def make_chart(airport, obs_df, model_df, forecast_df):
             for i, (_, row) in enumerate(last_two.iterrows()):
 
                 y = safe_float(row.get("modelled_max_abs"))
+
                 if y is None:
                     continue
 
@@ -239,25 +280,44 @@ def make_chart(airport, obs_df, model_df, forecast_df):
                         y=[y, y],
                         mode="lines",
                         name="Recent model forecast" if i == 0 else None,
-                        line=dict(
-                            color="rgba(37,99,235,0.9)",
-                            width=2,
-                            dash="dot"
-                        ),
+                        line=dict(color="rgba(37,99,235,0.8)", width=2, dash="dot"),
                         showlegend=(i == 0),
                     )
                 )
 
     if not latest_fc.empty:
-        y = safe_float(latest_fc["forecast_avg_max"].iloc[0]) if "forecast_avg_max" in latest_fc.columns else None
-        if y is not None:
+
+        if "forecast_avg_max" in latest_fc.columns:
+
+            y = safe_float(latest_fc["forecast_avg_max"].iloc[0])
+
+            if y is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[0, 24],
+                        y=[y, y],
+                        mode="lines",
+                        name="Forecast avg max",
+                        line=dict(color="green", width=2),
+                    )
+                )
+
+        qcols = get_forecast_quantile_columns(latest_fc)
+
+        for qcol in qcols:
+
+            qy = safe_float(latest_fc[qcol].iloc[0])
+
+            if qy is None:
+                continue
+
             fig.add_trace(
                 go.Scatter(
                     x=[0, 24],
-                    y=[y, y],
+                    y=[qy, qy],
                     mode="lines",
-                    name="Forecast avg max",
-                    line=dict(color="green", width=2),
+                    name=pretty_quantile_name(qcol),
+                    line=dict(color="rgba(168,85,247,0.45)", width=1.5),
                 )
             )
 
@@ -286,6 +346,8 @@ def make_chart(airport, obs_df, model_df, forecast_df):
 
     return fig
 
+
+# LOAD DATA
 
 obs_df = load_parquet(OBS_PATH)
 model_df = load_parquet(MODEL_PATH)
