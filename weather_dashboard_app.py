@@ -394,10 +394,13 @@ def airport_stats(airport, obs_df, model_df, forecast_df):
 
     if not latest_fc.empty:
         row = latest_fc.iloc[0]
-        fc_avg = safe_float(row.get("forecast_avg_max"))
         fc1 = safe_float(row.get("forecast_source_1"))
         fc2 = safe_float(row.get("forecast_source_2"))
         fc3 = safe_float(row.get("forecast_source_3"))
+
+        avg_inputs = [v for v in [fc2, fc3] if v is not None]
+        fc_avg = sum(avg_inputs) / len(avg_inputs) if avg_inputs else None
+
         fc_updated = row.get("pulled_at_local")
 
         for qcol in get_forecast_quantile_columns(latest_fc):
