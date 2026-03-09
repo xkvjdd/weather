@@ -80,6 +80,10 @@ def today_local_str(tz):
     return datetime.now(ZoneInfo(tz)).date().isoformat()
 
 
+def f_to_c(temp_f):
+    return round((float(temp_f) - 32) * 5 / 9, 3)
+
+
 def clean_temp_c(x):
     if x is None or pd.isna(x):
         return None
@@ -100,7 +104,7 @@ def mean_ignore_none(values):
 
 
 # ------------------------------------------------
-# S1 WUNDERGROUND (F → C)
+# S1 WUNDERGROUND (F -> C)
 # ------------------------------------------------
 
 def fetch_wunderground_forecast_high(icao):
@@ -113,8 +117,7 @@ def fetch_wunderground_forecast_high(icao):
             return None
 
         temp_f = float(m.group(1))
-        temp_c = (temp_f - 32) * 5 / 9
-        return round(temp_c, 3)
+        return f_to_c(temp_f)
 
     except Exception as e:
         print(f"[WUNDERGROUND FAIL {icao}] {e}")
@@ -122,23 +125,23 @@ def fetch_wunderground_forecast_high(icao):
 
 
 # ------------------------------------------------
-# S2 BBC (already °C)
+# S2 BBC (already C)
 # ------------------------------------------------
 
 def fetch_bbc_today_high(airport):
     url = BBC_WEATHER_URLS.get(airport)
-
     if not url:
         return None
 
     try:
         html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
-        m = re.search(
-            r'<div class="wr-day-temperature__high-value">.*?<span class="wr-value--temperature--c">(-?\d+)°</span>',
-            html,
-            re.IGNORECASE | re.DOTALL,
-        )
+        i = html.find("wr-day-temperature__high-value")
+        if i == -1:
+            return None
+
+        snippet = html[i:i + 120]
+        m = re.search(r"([0-9]+)", snippet)
         if m:
             return float(m.group(1))
 
@@ -149,25 +152,28 @@ def fetch_bbc_today_high(airport):
 
 
 # ------------------------------------------------
-# S3 ACCUWEATHER (F → C)
+# S3 ACCUWEATHER (F -> C)
 # ------------------------------------------------
 
 def fetch_accuweather_today_high(airport):
     url = ACCUWEATHER_URLS.get(airport)
-
     if not url:
         return None
 
     try:
         html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
-        m = re.search(r'temp-hi">(-?\d+)', html)
+        i = html.find("temp-hi")
+        if i == -1:
+            return None
+
+        snippet = html[i:i + 80]
+        m = re.search(r"([0-9]{2,3})", snippet)
         if not m:
             return None
 
         temp_f = float(m.group(1))
-        temp_c = (temp_f - 32) * 5 / 9
-        return round(temp_c, 3)
+        return f_to_c(temp_f)
 
     except Exception as e:
         print(f"[ACCUWEATHER FAIL {airport}] {e}")
@@ -209,8 +215,8 @@ def main():
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(process_airport, a, m): a
-            for a, m in AIRPORTS.items()
+            executor.submit(process_airport, airport, meta): airport
+            for airport, meta in AIRPORTS.items()
         }
 
         for future in as_completed(futures):
