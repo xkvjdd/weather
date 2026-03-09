@@ -313,7 +313,14 @@ def make_chart(airport, obs_df, model_df, forecast_df):
                 )
 
     if not latest_fc.empty:
-        y = safe_float(latest_fc["forecast_avg_max"].iloc[0]) if "forecast_avg_max" in latest_fc.columns else None
+        row = latest_fc.iloc[0]
+    
+        s2 = safe_float(row.get("forecast_source_2"))
+        s3 = safe_float(row.get("forecast_source_3"))
+    
+        avg_inputs = [v for v in [s2, s3] if v is not None]
+        y = sum(avg_inputs) / len(avg_inputs) if avg_inputs else None
+    
         if y is not None:
             fig.add_trace(
                 go.Scatter(
