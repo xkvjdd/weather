@@ -80,6 +80,18 @@ def today_local_str(tz):
     return datetime.now(ZoneInfo(tz)).date().isoformat()
 
 
+def clean_temp_c(x):
+    if x is None or pd.isna(x):
+        return None
+    try:
+        x = float(x)
+    except Exception:
+        return None
+    if x < -60 or x > 60:
+        return None
+    return round(x, 3)
+
+
 def mean_ignore_none(values):
     xs = [float(v) for v in values if v is not None and not pd.isna(v)]
     if not xs:
@@ -104,7 +116,8 @@ def fetch_wunderground_forecast_high(icao):
         temp_c = (temp_f - 32) * 5 / 9
         return round(temp_c, 3)
 
-    except:
+    except Exception as e:
+        print(f"[WUNDERGROUND FAIL {icao}] {e}")
         return None
 
 
@@ -121,12 +134,16 @@ def fetch_bbc_today_high(airport):
     try:
         html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
 
-        m = re.search(r'High[^0-9-]*(-?\d+)', html)
+        m = re.search(
+            r'<div class="wr-day-temperature__high-value">.*?<span class="wr-value--temperature--c">(-?\d+)°</span>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
         if m:
             return float(m.group(1))
 
-    except:
-        pass
+    except Exception as e:
+        print(f"[BBC FAIL {airport}] {e}")
 
     return None
 
@@ -152,8 +169,10 @@ def fetch_accuweather_today_high(airport):
         temp_c = (temp_f - 32) * 5 / 9
         return round(temp_c, 3)
 
-    except:
-        return None
+    except Exception as e:
+        print(f"[ACCUWEATHER FAIL {airport}] {e}")
+
+    return None
 
 
 def process_airport(airport, meta):
@@ -162,9 +181,9 @@ def process_airport(airport, meta):
 
     pulled_at = now_local_naive(tz)
 
-    s1 = fetch_wunderground_forecast_high(icao)
-    s2 = fetch_bbc_today_high(airport)
-    s3 = fetch_accuweather_today_high(airport)
+    s1 = clean_temp_c(fetch_wunderground_forecast_high(icao))
+    s2 = clean_temp_c(fetch_bbc_today_high(airport))
+    s3 = clean_temp_c(fetch_accuweather_today_high(airport))
 
     avg = mean_ignore_none([s1, s2, s3])
 
