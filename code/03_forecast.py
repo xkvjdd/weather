@@ -1,13 +1,22 @@
-# Requirements: requests, pandas, pyarrow
+# Requirements:
+# requests, pandas, pyarrow, herbie-data, xarray, cfgrib, eccodes
+#
+# If needed:
+# pip uninstall herbie
+# pip install herbie-data xarray cfgrib eccodes
 
 import os
 import re
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
+import xarray as xr
+from herbie import Herbie
 
 
 AIRPORTS = {
@@ -24,6 +33,16 @@ AIRPORTS = {
     "BUE": {"icao": "SAEZ", "tz": "America/Argentina/Buenos_Aires"},
     "LON": {"icao": "EGLC", "tz": "Europe/London"},
     "WLG": {"icao": "NZWN", "tz": "Pacific/Auckland"},
+}
+
+# METAR-TAF airport coordinates for US airports only
+HRRR_COORDS = {
+    "ATL": {"lat": 33.63670, "lon": -84.42790},   # KATL
+    "NYC": {"lat": 40.77720, "lon": -73.87260},   # KLGA
+    "CHI": {"lat": 41.97690, "lon": -87.90810},   # KORD
+    "DAL": {"lat": 32.84590, "lon": -96.85090},   # KDAL
+    "SEA": {"lat": 47.44990, "lon": -122.31180},  # KSEA
+    "MIA": {"lat": 25.79540, "lon": -80.29010},   # KMIA
 }
 
 
@@ -69,7 +88,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(DATA_DIR, "forecast_latest.parquet")
 
 HTTP_TIMEOUT = 15
-MAX_WORKERS = 6
+
+# Keep this low on Windows because cfgrib/eccodes can be unstable with parallel GRIB reads.
+MAX_WORKERS = 1
 
 
 def now_local_naive(tz):
@@ -104,24 +125,81 @@ def mean_ignore_none(values):
 
 
 # ------------------------------------------------
-# S1 WUNDERGROUND (F -> C)
+# S1 HRRR (C) - US airports only
 # ------------------------------------------------
 
-def fetch_wunderground_forecast_high(icao):
-    try:
-        url = f"https://www.wunderground.com/weather/{icao}"
-        html = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT).text
-
-        m = re.search(r'"temperatureMax":\[(\-?\d+)', html)
-        if not m:
-            return None
-
-        temp_f = float(m.group(1))
-        return f_to_c(temp_f)
-
-    except Exception as e:
-        print(f"[WUNDERGROUND FAIL {icao}] {e}")
+def fetch_hrrr_today_high_c(airport, tz):
+    coords = HRRR_COORDS.get(airport)
+    if not coords:
         return None
+
+    lat = coords["lat"]
+    lon = coords["lon"]
+
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    today_local = now_utc.astimezone(ZoneInfo(tz)).date()
+
+    warnings.filterwarnings("ignore")
+
+    # Try latest likely available run first, then fall back
+    for lag in [1, 2, 3, 4]:
+        run = (now_utc - timedelta(hours=lag)).replace(
+            tzinfo=None, minute=0, second=0, microsecond=0
+        )
+
+        vals = []
+
+        try:
+            for fxx in range(19):
+                H = Herbie(
+                    run,
+                    model="hrrr",
+                    product="sfc",
+                    fxx=fxx,
+                    priority="aws",
+                    verbose=False,
+                )
+
+                grib_file = H.download(":TMP:2 m above ground:")
+
+                ds = xr.open_dataset(
+                    grib_file,
+                    engine="cfgrib",
+                    backend_kwargs={"indexpath": ""},
+                )
+
+                try:
+                    # HRRR longitude may be 0..360 depending on how cfgrib opens it
+                    ds_lon_max = float(np.nanmax(ds.longitude.values))
+                    target_lon = lon % 360 if ds_lon_max > 180 else lon
+
+                    dist = ((ds.latitude - lat) ** 2 + (ds.longitude - target_lon) ** 2).values
+                    k = int(np.argmin(dist))
+                    nx = ds.latitude.shape[1]
+                    y, x = divmod(k, nx)
+
+                    temp_c = float(ds["t2m"].isel(y=y, x=x).item() - 273.15)
+
+                    valid_date_local = (
+                        (run + timedelta(hours=fxx))
+                        .replace(tzinfo=ZoneInfo("UTC"))
+                        .astimezone(ZoneInfo(tz))
+                        .date()
+                    )
+
+                    if valid_date_local == today_local:
+                        vals.append(temp_c)
+                finally:
+                    ds.close()
+
+            if vals:
+                return clean_temp_c(max(vals))
+
+        except Exception as e:
+            print(f"[HRRR FAIL {airport} lag={lag}] {e}")
+            continue
+
+    return None
 
 
 # ------------------------------------------------
@@ -187,7 +265,7 @@ def process_airport(airport, meta):
 
     pulled_at = now_local_naive(tz)
 
-    s1 = clean_temp_c(fetch_wunderground_forecast_high(icao))
+    s1 = clean_temp_c(fetch_hrrr_today_high_c(airport, tz))
     s2 = clean_temp_c(fetch_bbc_today_high(airport))
     s3 = clean_temp_c(fetch_accuweather_today_high(airport))
 
@@ -204,7 +282,7 @@ def process_airport(airport, meta):
         "forecast_source_2": s2,
         "forecast_source_3": s3,
         "forecast_avg_max": avg,
-        "source_1_name": "wunderground",
+        "source_1_name": "hrrr",
         "source_2_name": "bbc",
         "source_3_name": "accuweather",
     }
